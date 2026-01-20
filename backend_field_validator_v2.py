@@ -28,6 +28,269 @@ app = Flask(__name__)
 CORS(app)
 
 
+class RuleIndexer:
+    """Generic rule indexing for ANY policy structure"""
+    
+    def __init__(self, rules_content):
+        self.rules_content = rules_content
+        self.rules = []  # List of parsed rules
+        self._build_index()
+    
+    def _build_index(self):
+        """Dynamically extract and index ALL rules from content"""
+        import re
+        
+        lines = self.rules_content.split('\n')
+        current_rule = None
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Start of a new rule
+            if line_stripped.startswith('rule:'):
+                # Save previous rule if exists
+                if current_rule:
+                    self.rules.append(current_rule)
+                
+                # Extract rule name
+                rule_name = line_stripped.replace('rule:', '').strip()
+                current_rule = {
+                    'name': rule_name,
+                    'conditions': [],
+                    'source': None,
+                    'raw_text': line_stripped
+                }
+            
+            # Extract conditions and THEN clauses (IF/THEN statements)
+            elif line_stripped.startswith('- IF') and current_rule:
+                condition_text = line_stripped.replace('- IF', '').strip()
+                current_rule['conditions'].append(condition_text)
+                
+                # Also extract THEN clause if on same line or next line
+                if 'THEN' in condition_text:
+                    then_part = condition_text.split('THEN', 1)[1].strip()
+                    if 'then_clause' not in current_rule:
+                        current_rule['then_clause'] = []
+                    current_rule['then_clause'].append(then_part)
+            
+            # Extract THEN clauses (can be on continuation lines)
+            elif line_stripped.startswith('THEN') and current_rule:
+                then_text = line_stripped.replace('THEN', '').strip()
+                if 'then_clause' not in current_rule:
+                    current_rule['then_clause'] = []
+                current_rule['then_clause'].append(then_text)
+            
+            # Extract source
+            elif line_stripped.startswith('SOURCE:') and current_rule:
+                current_rule['source'] = line_stripped.replace('SOURCE:', '').strip()
+            
+            # Also parse numeric constants (e.g., allowance.lodging.tour.M3.A: 2000)
+            elif ':' in line_stripped and not any(x in line_stripped for x in ['=', 'rule:', 'SOURCE:']):
+                # Parse as constant/value definition
+                match = re.match(r'([\w.]+):\s*(.+?)(?:\s*$)', line_stripped)
+                if match:
+                    key, value = match.groups()
+                    self.rules.append({
+                        'name': key,
+                        'value': value.strip().strip('"\''),
+                        'type': 'constant',
+                        'raw_text': line_stripped
+                    })
+        
+        # Add last rule
+        if current_rule:
+            self.rules.append(current_rule)
+    
+    def _generate_field_pattern(self, context_normalized):
+        """
+        Dynamically generate regex pattern for extracting entity.field references
+        Uses Gemini to analyze the context and rules to determine valid entity types
+        """
+        import re
+        
+        # Extract all entity.field patterns from rules to understand structure
+        all_entities = set()
+        for rule in self.rules:
+            if rule.get('type') != 'constant' and rule.get('conditions', []):
+                combined = ' '.join(rule.get('conditions', []) + rule.get('then_clause', [])).lower()
+                # Find any entity.field pattern (broad match)
+                entities = re.findall(r'(\w+)\.[\w_]+', combined)
+                all_entities.update(entities)
+        
+        # Get context keys as potential entities
+        context_entities = set(context_normalized.keys())
+        
+        # Combine all possible entities
+        possible_entities = list(all_entities | context_entities)
+        possible_entities = sorted(set([e for e in possible_entities if len(e) > 1]))  # Filter short names
+        
+        # If we have entities, use them; otherwise use broader pattern
+        if possible_entities:
+            # Create pattern from found entities: (entity1|entity2|entity3)\.(\w+)
+            entity_pattern = '|'.join(possible_entities)
+            field_pattern = rf'({entity_pattern})\.([\w_]+)'
+        else:
+            # Fallback to broader pattern that matches any entity.field
+            field_pattern = r'([\w_]+)\.([\w_]+)'
+        
+        return field_pattern
+    
+    def lookup(self, field_name, context):
+        """
+        Generically lookup rules for any field given context.
+        Works with ANY policy structure - numeric, boolean, conditional, etc.
+        """
+        if not self.rules or not context:
+            return None
+        
+        # Normalize context
+        context_normalized = {}
+        context_values_flat = []
+        
+        if isinstance(context, list):
+            # Handle list of context items
+            for item in context:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        normalized_key = k.lower().replace('.', '_')
+                        context_normalized[normalized_key] = str(v)
+                        context_values_flat.append(str(v).lower())
+        else:
+            # Handle dict context
+            for k, v in context.items():
+                normalized_key = k.lower().replace('.', '_')
+                context_normalized[normalized_key] = str(v)
+                context_values_flat.append(str(v).lower())
+        
+        matching_rules = []
+        
+        # Dynamically generate field pattern based on actual entities in rules
+        field_pattern = self._generate_field_pattern(context_normalized)
+        
+        # Search through ALL rules - stricter matching
+        for rule in self.rules:
+            rule_name = rule.get('name', '').lower()
+            conditions = rule.get('conditions', [])
+            then_clauses = rule.get('then_clause', [])
+            
+            # Only match if rule is a conditional rule (not a metadata line)
+            if rule.get('type') != 'constant' and conditions:
+                combined_text = ' '.join(conditions + then_clauses).lower()
+                
+                # Try to find field_name mentioned in conditions or THEN clause
+                # Extract actual field references from conditions using dynamic pattern
+                field_mentions = []
+                import re
+                matches = re.findall(field_pattern, combined_text)
+                # Extract just the field name (second group if tuple, else use as-is)
+                field_mentions = [m[1] if isinstance(m, tuple) else m for m in matches]
+                
+                # Also handle multi-level fields like patient.incapacity.duration
+                # Extract all dot-separated words and add the deepest levels
+                deep_fields = re.findall(r'(?:[\w_]+\.)+(\w+)', combined_text)
+                field_mentions.extend(deep_fields)
+                
+                # Also check for plain field names (without entity prefix) in THEN clause
+                then_text = ' '.join(rule.get('then_clause', [])).lower()
+                plain_fields = re.findall(r'([a-z_]+)\s*=', then_text)
+                field_mentions.extend(plain_fields)
+                
+                # For value-based matching (e.g., "pregnancy" in condition value)
+                # Extract values from conditions that might match field names
+                condition_text = ' '.join(conditions).lower()
+                quoted_values = re.findall(r'"([^"]+)"', condition_text)
+                field_mentions.extend(quoted_values)
+                
+                # Check if our field_name or similar matches any mentioned field
+                field_lower = field_name.lower().replace('_', '').replace('-', '')
+                field_mentions_normalized = [fm.lower().replace('_', '').replace('-', '') for fm in field_mentions]
+                
+                # Direct match
+                field_matches = [fm for fm in field_mentions if fm.lower().replace('_', '').replace('-', '') == field_lower]
+                
+                # Also allow suffix matches (e.g., "duration" matches "incapacity_duration")
+                if not field_matches:
+                    for fm_norm, fm_orig in zip(field_mentions_normalized, field_mentions):
+                        if field_lower.endswith(fm_norm) and len(fm_norm) > 2:  # Suffix match with min length
+                            field_matches.append(fm_orig)
+                            break
+                
+                if field_matches:
+                    # Direct field match - check context values for additional confirmation
+                    match_score = 0
+                    for ctx_val in context_values_flat:
+                        if ctx_val and ctx_val in combined_text:
+                            match_score += 1
+                    
+                    # Reward for direct field match
+                    matching_rules.append((rule, 200 + match_score * 10))
+                else:
+                    # No direct field match, but check if context values appear in quoted values (for prohibition rules)
+                    condition_text = ' '.join(conditions).lower()
+                    quoted_values = re.findall(r'"([^"]+)"', condition_text)
+                    
+                    # Check if any context value matches quoted value in prohibition
+                    for ctx_val in context_values_flat:
+                        if ctx_val and any(ctx_val in qv.lower() for qv in quoted_values if qv):
+                            # This is likely a value-based match (e.g., "genetic services" in context matches quoted value)
+                            if 'prohibited' in rule_name or 'denied' in ' '.join(conditions + rule.get('then_clause', [])).lower():
+                                matching_rules.append((rule, 180))  # High score for value match on prohibition
+                                break
+            
+            # Also match numeric constants by field name
+            elif rule.get('type') == 'constant':
+                rule_name_key = rule.get('name', '').lower()
+                if field_name.lower() in rule_name_key:
+                    # Check if rule key contains any context value
+                    for ctx_val in context_values_flat:
+                        if ctx_val and ctx_val in rule_name_key:
+                            matching_rules.append((rule, 80))
+                            break
+        
+        # Try semantic inference if no direct match found
+        best_rule = None
+        if not matching_rules:
+            # Check if field_name suggests it's measuring time/deadline related
+            field_lower = field_name.lower()
+            if any(word in field_lower for word in ['days', 'since', 'deadline', 'duration', 'within']):
+                # This looks like a numeric temporal constraint field
+                # Try to find rules with numeric constraints
+                for rule in self.rules:
+                    if rule.get('type') != 'constant' and rule.get('conditions', []):
+                        combined_text = ' '.join(rule.get('conditions', []) + rule.get('then_clause', [])).lower()
+                        # Look for time-related keywords
+                        if any(word in combined_text for word in ['within', 'days', 'deadline', 'duration', 'calendar']):
+                            # This rule has temporal constraints
+                            matching_rules.append((rule, 150))  # Lower score than direct match
+        
+        # Return best matching rule
+        if matching_rules:
+            # Sort by score and return highest
+            matching_rules.sort(key=lambda x: x[1], reverse=True)
+            best_rule = matching_rules[0][0]
+        else:
+            best_rule = None
+        
+        if best_rule:
+             # Convert to lookup format for compatibility
+            if best_rule.get('type') == 'constant':
+                return {
+                    'rule': best_rule.get('raw_text', ''),
+                    'value': best_rule.get('value'),
+                    'name': best_rule.get('name')
+                }
+            else:
+                return {
+                    'rule': best_rule.get('name', ''),
+                    'conditions': best_rule.get('conditions', []),
+                    'then_clause': best_rule.get('then_clause', []),
+                    'source': best_rule.get('source'),
+                    'name': best_rule.get('name')
+                }
+        
+        return None
+
+
 class FieldValidator:
     """Dynamic field validation following policy_validator.py approach"""
 
@@ -37,6 +300,11 @@ class FieldValidator:
         self.log = []
         
         genai.configure(api_key=GEMINI_API_KEY)
+        self.generation_config = genai.types.GenerationConfig(
+            temperature=0.1,
+            top_p=0.95,
+            top_k=40
+        )
         self.model = genai.GenerativeModel('gemma-3-27b-it')
         # self.model = genai.GenerativeModel('gemini-2.5-flash-lite')
         
@@ -45,6 +313,7 @@ class FieldValidator:
         self.field_patterns_cache = {}
         self.rules_content = None
         self.rules_lines = []
+        self.rule_indexer = None
         
         # Initialize ChromaDB for embedding storage (will be initialized in startup)
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
@@ -62,7 +331,11 @@ class FieldValidator:
             # Load rules
             self._load_rules()
             
-            # Initialize ChromaDB with embeddings
+            # Initialize rule indexer (generic, works with any policy)
+            self.rule_indexer = RuleIndexer(self.rules_content)
+            self.log_entry("STARTUP", f"✓ Built generic rule index with {len(self.rule_indexer.rules)} rules")
+            
+            # Initialize ChromaDB with embeddings (keep for complex queries)
             self._init_chroma_collection()
             
             # Populate ChromaDB
@@ -244,11 +517,11 @@ class FieldValidator:
             self.log_entry("ERROR", f"Multi-query semantic search failed: {e}")
             return []
     
-    def semantic_search_by_field(self, field_name, field_value):
+    def semantic_search_by_field(self, field_name, field_value, context=None):
         """Specialized semantic search for a field with intelligent query generation"""
         try:
             # Generate contextual query for the field
-            query = self._generate_search_query(field_name, field_value)
+            query = self._generate_search_query(field_name, field_value, context)
             self.log_entry("FIELD_QUERY", f"{field_name}: {query}")
             
             # Perform semantic search
@@ -258,28 +531,35 @@ class FieldValidator:
             self.log_entry("ERROR", f"Field-based semantic search failed: {e}")
             return []
     
-    def _generate_search_query(self, field_name, field_value):
+    def _generate_search_query(self, field_name, field_value, context=None):
         """Generate an intelligent search query for a field"""
+        context_str = ""
+        if context:
+            context_items = [f"{k}={v}" for k, v in context.items()]
+            context_str = f"\nContext: {', '.join(context_items)}"
+        
         prompt = f"""Create a semantic search query to find policy constraints for this field.
 
 Field Name: {field_name}
-Field Value: {field_value}
+Field Value: {field_value}{context_str}
 
 TASK: Generate a SHORT search query (1-2 sentences) that will find the SPECIFIC policy rule/constraint for this field.
 - Include what the field represents
 - Include what constraint or requirement you're looking for
 - Be specific about what type of limit or rule to find
+- If context is provided, include relevant context keywords (like grade, city, travel type)
 
 Examples:
 - For group_size=6: "how many employees can travel together limit employees travelling"
 - For room_type=suite: "room upgrades policies standard room requirements"
 - For flight_hours=8: "flight duration class of service business class first class"
+- For lodging with context: "lodging allowance M3 city A tour"
 
 RESPOND WITH ONLY THE QUERY (no quotes):
 search_query_here"""
 
         try:
-            response = self.model.generate_content(prompt)
+            response = self.model.generate_content(prompt, generation_config=self.generation_config)
             query = response.text.strip().strip('"\'')
             return query
         except Exception as e:
@@ -308,9 +588,177 @@ search_query_here"""
                 }
             }
 
-        # Step 1: Semantic search for relevant rules
-        self.log_entry("SEARCH", f"Performing semantic search for {field_name}")
-        search_results = self.semantic_search_by_field(field_name, field_value)
+        # Step 1: Use dynamic rule indexing (no semantic search, no hardcoding)
+        self.log_entry("INDEX_LOOKUP", f"Looking up rule for {field_name} with context {previous_context}")
+        
+        indexed_rule = None
+        if self.rule_indexer:
+            # Try lookup with field_name as-is, and also try extracting base field name
+            indexed_rule = self.rule_indexer.lookup(field_name, previous_context)
+            
+            # If not found, try to extract base field name (e.g., "lodging" from "lodging_requested")
+            if not indexed_rule and '_' in field_name:
+                base_field = field_name.split('_')[0]
+                self.log_entry("FIELD_EXTRACT", f"Trying base field: {base_field}")
+                indexed_rule = self.rule_indexer.lookup(base_field, previous_context)
+        
+        if indexed_rule:
+            # Found via indexing - use it directly
+            self.log_entry("INDEX_HIT", f"Found indexed rule: {indexed_rule.get('rule', indexed_rule.get('name', ''))}")
+            
+            # Handle numeric rules (constants)
+            if indexed_rule.get('type') == 'constant' or 'value' in indexed_rule:
+                try:
+                    field_value_num = float(field_value)
+                    limit_value = float(indexed_rule.get('value', 0))
+                    self.log_entry("NUMERIC_VALIDATION", f"Direct validation: {field_value_num} vs limit {limit_value}")
+                    is_valid = field_value_num <= limit_value
+                    
+                    return {
+                        'field_name': field_name,
+                        'field_value': field_value,
+                        'status': 'valid' if is_valid else 'error',
+                        'message': f"{'✓' if is_valid else '✗'} {field_name} ({field_value}) {'is within' if is_valid else 'exceeds'} allowance ({limit_value})",
+                        'rules': [indexed_rule.get('rule', indexed_rule.get('name', ''))],
+                        'validation_details': {
+                            'search_method': 'indexed_lookup',
+                            'indexed_rule': indexed_rule.get('rule'),
+                            'decision_reasoning': f"Direct rule match: {field_name} allowance is {limit_value}. Value {field_value} {'complies' if is_valid else 'violates'} this limit."
+                        }
+                    }
+                except (ValueError, TypeError):
+                    pass  # Not numeric, proceed to conditional logic
+            
+            # Handle conditional rules (FMLA, complex policies)
+            conditions = indexed_rule.get('conditions', [])
+            if conditions:
+                self.log_entry("CONDITIONAL_RULE", f"Evaluating conditions for {indexed_rule.get('name', '')}")
+                
+                # Parse conditions for numeric constraints and denied status
+                # Look for patterns like "MUST be within 15", "<= 15", "> 5", etc.
+                import re
+                constraint_match = None
+                constraint_value = None
+                constraint_operator = None
+                
+                # Extract numeric constraints from conditions AND THEN clauses
+                then_clauses = indexed_rule.get('then_clause', [])
+                combined_conditions = ' '.join(conditions + then_clauses).lower()
+                
+                # Check if rule explicitly denies the request
+                is_denied = re.search(r'=\s*DENIED|request\s*=\s*DENIED', combined_conditions, re.IGNORECASE)
+                if is_denied:
+                    self.log_entry("DENIED_RULE", f"Rule {indexed_rule.get('name')} explicitly denies this request")
+                    return {
+                        'field_name': field_name,
+                        'field_value': field_value,
+                        'status': 'error',
+                        'message': f"✗ {field_name} is DENIED by rule: {indexed_rule.get('name', '')}",
+                        'rules': conditions,
+                        'validation_details': {
+                            'search_method': 'indexed_lookup',
+                            'rule_name': indexed_rule.get('name'),
+                            'conditions': conditions,
+                            'source': indexed_rule.get('source'),
+                            'decision_reasoning': f"Rule {indexed_rule.get('name')} specifies: {' '.join(then_clauses)}"
+                        }
+                    }
+                
+                # First, resolve variable references like "fmla.certification_deadline" → "15"
+                for rule in self.rule_indexer.rules:
+                    if rule.get('type') == 'constant':
+                        const_name = rule.get('name', '').lower()
+                        const_value = rule.get('value', '')
+                        # Extract just the number from values like "15 calendar days"
+                        number_match = re.search(r'(\d+)', const_value)
+                        if number_match:
+                            const_value = number_match.group(1)
+                        # Replace constant names with their values in combined conditions
+                        combined_conditions = combined_conditions.replace(const_name, const_value)
+                
+                # Pattern: "within 15", "15 days", "<= 15", "> 5", "maximum 15", "minimum 3"
+                patterns = [
+                    (r'within\s+(\d+)', '<='),  # "within 15" → <= 15
+                    (r'<=\s*(\d+)', '<='),      # "<= 15"
+                    (r'>=\s*(\d+)', '>='),      # ">= 15"
+                    (r'<\s*(\d+)', '<'),        # "< 15"
+                    (r'>\s*(\d+)', '>'),        # "> 5"
+                    (r'maximum\s+(\d+)', '<='), # "maximum 15" → <= 15
+                    (r'minimum\s+(\d+)', '>='), # "minimum 3" → >= 3
+                    (r'exactly\s+(\d+)', '=='), # "exactly 3" → == 3
+                ]
+                
+                for pattern, operator in patterns:
+                    match = re.search(pattern, combined_conditions)
+                    if match:
+                        constraint_value = int(match.group(1))
+                        constraint_operator = operator
+                        constraint_match = match
+                        break
+                
+                # Validate against constraint if found
+                is_valid = True
+                reasoning = f"Field {field_name} matches conditional rule."
+                
+                if constraint_value is not None and constraint_operator:
+                    try:
+                        field_val_num = float(field_value)
+                        
+                        if constraint_operator == '<=':
+                            is_valid = field_val_num <= constraint_value
+                        elif constraint_operator == '>=':
+                            is_valid = field_val_num >= constraint_value
+                        elif constraint_operator == '<':
+                            is_valid = field_val_num < constraint_value
+                        elif constraint_operator == '>':
+                            is_valid = field_val_num > constraint_value
+                        elif constraint_operator == '==':
+                            is_valid = field_val_num == constraint_value
+                        
+                        reasoning = f"Constraint: {field_name} {constraint_operator} {constraint_value}. Value: {field_value}. {'Complies' if is_valid else 'Violates'} constraint."
+                        
+                        self.log_entry("CONSTRAINT_CHECK", f"{field_name}={field_value} vs {constraint_operator} {constraint_value}: {'PASS' if is_valid else 'FAIL'}")
+                    except (ValueError, TypeError):
+                        # Field value not numeric but constraint expects numeric
+                        is_valid = False
+                        reasoning = f"ERROR: {field_name} expects numeric value for constraint {constraint_operator} {constraint_value}, but got non-numeric value: {field_value}"
+                        self.log_entry("TYPE_ERROR", f"{field_name} type mismatch: expected numeric, got '{field_value}'")
+                
+                return {
+                    'field_name': field_name,
+                    'field_value': field_value,
+                    'status': 'valid' if is_valid else 'error',
+                    'message': f"{'✓' if is_valid else '✗'} {field_name} {'matches' if is_valid else 'violates'} rule: {indexed_rule.get('name', '')}",
+                    'rules': conditions,
+                    'validation_details': {
+                        'search_method': 'indexed_lookup',
+                        'rule_name': indexed_rule.get('name'),
+                        'conditions': conditions,
+                        'source': indexed_rule.get('source'),
+                        'constraint': f"{constraint_operator} {constraint_value}" if constraint_value else None,
+                        'decision_reasoning': reasoning
+                    }
+                }
+        else:
+            # No indexed rule found - strict mode: context doesn't match any rule
+            # Don't fall back to semantic search; return error or "no matching rule"
+            self.log_entry("NO_INDEXED_RULE", f"No matching rule found in index for {field_name} with context {previous_context}")
+            return {
+                'field_name': field_name,
+                'field_value': field_value,
+                'status': 'error',
+                'message': f'✗ No matching policy rule found for {field_name} with given context',
+                'rules': [],
+                'validation_details': {
+                    'search_method': 'indexed_lookup',
+                    'rules_found': 0,
+                    'decision_reasoning': f'The provided context ({previous_context}) does not match any policy rule. This context combination is not defined in the policy.'
+                }
+            }
+        
+        # Step 2: Semantic search only used if indexed rule exists but needs Gemini analysis
+        self.log_entry("SEMANTIC_ANALYSIS", f"Using semantic search for non-numeric fields")
+        search_results = self.semantic_search_by_field(field_name, field_value, previous_context)
         
         if not search_results:
             self.log_entry("NO_RULES", f"No relevant rules found for {field_name}")
@@ -327,15 +775,24 @@ search_query_here"""
                 }
             }
 
-        # Step 2: Filter and format rules
+        # Step 3: Filter and format rules - prioritize rules matching context
         formatted_rules = [result['line'] for result in search_results[:10]]
+        
+        # Try to extract the most relevant rule for the given context
+        most_relevant_rule = self._extract_most_relevant_rule(formatted_rules, field_name, previous_context)
+        if most_relevant_rule:
+            # Put most relevant rule first
+            formatted_rules = [most_relevant_rule] + [r for r in formatted_rules if r != most_relevant_rule]
+        
         rules_text = "\n".join(formatted_rules)
         
         self.log_entry("RULES_FOUND", f"Found {len(search_results)} relevant rules, using top {len(formatted_rules)}")
 
-        # Step 3: Generate validation decision from found rules
+        # Step 4: Generate validation decision from found rules
+        # Use only the top rules (prioritized with most relevant first)
+        rules_for_decision = formatted_rules[:5]
         decision = self._generate_validation_decision(
-            field_name, field_value, formatted_rules, previous_context
+            field_name, field_value, rules_for_decision, previous_context
         )
 
         return {
@@ -359,6 +816,28 @@ search_query_here"""
 
 
 
+    def _extract_most_relevant_rule(self, rules, field_name, context):
+        """Extract the most relevant rule based on context"""
+        if not context or not rules:
+            return None
+        
+        import re
+        
+        # Look for rules that match all context fields
+        if isinstance(context, list):
+            context_values = [str(item.get('field_value', '')).lower() for item in context if isinstance(item, dict)]
+        else:
+            context_values = [str(v).lower() for v in context.values()]
+        
+        for rule in rules:
+            rule_lower = rule.lower()
+            # Count how many context values appear in the rule
+            matches = sum(1 for val in context_values if val in rule_lower)
+            if matches >= 2:  # At least 2 context fields should match
+                return rule
+        
+        return None
+    
     def _generate_validation_decision(self, field_name, field_value, found_rules, previous_context):
         """Generate validation decision from found rules"""
         
@@ -371,33 +850,107 @@ search_query_here"""
         
         rules_text = "\n".join(found_rules[:10])
         
+        # Format context for the prompt
+        context_text = ""
+        if previous_context:
+            if isinstance(previous_context, list):
+                context_items = [f"- {item.get('field_name')}: {item.get('field_value')}" 
+                                for item in previous_context if isinstance(item, dict)]
+            else:
+                context_items = [f"- {k}: {v}" for k, v in previous_context.items()]
+            context_text = "\n".join(context_items)
+        
+        # Extract numeric limits from rules if field_value is numeric
+        numeric_limits = ""
+        try:
+            field_value_num = float(field_value)
+            # Look for allowance values in rules
+            import re
+            allowances = re.findall(r'(allowance\.[\w.]+):\s*(\d+)', rules_text)
+            if allowances:
+                numeric_limits = "\nExtracted numeric limits from rules:\n"
+                for allowance_name, value in allowances:
+                    numeric_limits += f"- {allowance_name}: {value}\n"
+        except:
+            pass
+        
         prompt = f"""Based on these policy rules, validate the field value.
 
 Field: {field_name} = {field_value}
 
+Context Information:
+{context_text if context_text else "No additional context provided"}
+
 Policy Rules:
 {rules_text}
+{numeric_limits}
 
-TASK: Determine if the value is:
-1. Valid - complies with policy
-2. Warning - acceptable but needs attention
-3. Error - violates policy
+TASK: Determine if the value complies with the policy rules by:
+1. Identifying which specific rule applies to this context
+2. Checking if the field value complies with that rule
+3. Returning: valid (complies), warning (needs attention), or error (violates)
+
+Provide clear reasoning explaining which rule applies and whether the value meets the requirement.
 
 RESPOND IN JSON:
 {{
   "status": "valid/warning/error",
   "message": "user-friendly message",
-  "reasoning": "brief explanation"
+  "reasoning": "explanation of which rule applies and whether value complies"
 }}"""
 
         try:
-            response = self.model.generate_content(prompt)
+            response = self.model.generate_content(prompt, generation_config=self.generation_config)
+            self.log_entry("GEMINI_RAW", f"Response object: {response}")
+            
+            # Check if response has content
+            if not hasattr(response, 'text') or not response.text:
+                self.log_entry("ERROR", "Gemini response empty or no text attribute")
+                # Return default valid decision
+                return {
+                    'status': 'valid',
+                    'message': '✓ Field validated (no gemini response)',
+                    'reasoning': 'Default approval due to empty response'
+                }
+            
             response_text = response.text.strip()
             
             if response_text.startswith('```json'):
                 response_text = response_text[7:-3]
             
+            self.log_entry("GEMINI_RESPONSE", f"Raw response: {response_text}")
+            
             decision = json.loads(response_text.strip())
+            self.log_entry("GEMINI_DECISION", f"Parsed: status={decision.get('status')}, reasoning={decision.get('reasoning')[:100]}")
+            
+            # Verify numeric comparison if the field value is numeric
+            try:
+                field_value_num = float(field_value)
+                # Extract allowance values from the rules
+                import re
+                allowances = re.findall(r':\s*(\d+)(?:\s|$)', ' '.join(found_rules))
+                if allowances:
+                    allowances_nums = [int(a) for a in allowances]
+                    max_allowance = max(allowances_nums)
+                    # If the reasoning mentions a specific allowance, try to extract it
+                    reasoning = decision.get('reasoning', '').lower()
+                    for allowance_val in allowances_nums:
+                        if str(allowance_val) in reasoning:
+                            max_allowance = allowance_val
+                            break
+                    
+                    # Override decision if numeric comparison is clear
+                    if field_value_num <= max_allowance and decision['status'] != 'valid':
+                        self.log_entry("OVERRIDE", f"Overriding gemini decision: {field_value_num} <= {max_allowance}, setting to valid")
+                        decision['status'] = 'valid'
+                        decision['message'] = f"✓ {field_name} ({field_value}) is within allowance ({max_allowance})"
+                    elif field_value_num > max_allowance and decision['status'] != 'error':
+                        self.log_entry("OVERRIDE", f"Overriding gemini decision: {field_value_num} > {max_allowance}, setting to error")
+                        decision['status'] = 'error'
+                        decision['message'] = f"✗ {field_name} ({field_value}) exceeds allowance ({max_allowance})"
+            except:
+                pass
+            
             return decision
         except Exception as e:
             self.log_entry("ERROR", f"Decision generation failed: {e}")
