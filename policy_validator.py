@@ -2,11 +2,21 @@
 """
 Generic Policy Enforcement System
 Step 1: Extract policies from PDF → filename.txt
-Step 2: Use grep + Gemini API to extract rules → rules.txt
+Step 1B: Extract & elaborate clauses with Gemini → stage1_clauses.json
+Step 2: Classify clause intents with Gemini → stage2_classified.json
+Step 3: Extract entities & thresholds with Gemini → stage3_entities.json
+Step 4: Detect ambiguities in clauses → stage4_ambiguity_flags.json
+Step 5: Clarify ambiguous clauses with Gemini → stage5_clarified_clauses.json
+Step 6: Generate DSL rules from clarified clauses → stage6_dsl_rules.yaml (NEW)
 
 Usage:
   python policy_validator.py extract <policy.pdf>
-  python policy_validator.py extract-rules <filename.txt>
+  python policy_validator.py extract-clauses <filename.txt>
+  python policy_validator.py classify-intents <stage1_clauses.json>
+  python policy_validator.py extract-entities <stage2_classified.json>
+  python policy_validator.py detect-ambiguities <stage3_entities.json>
+  python policy_validator.py clarify-ambiguities <stage3_entities.json>
+  python policy_validator.py generate-dsl <stage5_clarified_clauses.json>
 """
 
 import os
@@ -17,6 +27,8 @@ import re
 from pathlib import Path
 from datetime import datetime
 import google.generativeai as genai
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Configuration
 GEMINI_API_KEY = "AIzaSyBwRjRbssL6kxZPx55_I1yCONHdCZokM-c"
@@ -77,6 +89,819 @@ class PolicyExtractor:
         """Save extraction log"""
         with open(LOG_FILE, 'w') as f:
             f.write("=== POLICY EXTRACTION LOG ===\n")
+            f.write(f"Timestamp: {datetime.now()}\n")
+            f.write("="*50 + "\n\n")
+            for entry in self.log:
+                f.write(entry + "\n")
+
+
+class ClauseExtractor:
+    """
+    Step 1B: Extract & elaborate clauses from policy text.
+    
+    Output structure: Simple clause_id → text mapping for Stage 2 intent classification.
+    Each clause contains conditional statements, numerical values, enforcement levels, etc.
+    """
+    
+    def __init__(self, policy_file):
+        self.policy_file = policy_file
+        self.clauses_file = f"{OUTPUT_DIR}/stage1_clauses.json"
+        self.log = []
+        
+        # Initialize Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemma-3-27b-it')
+    
+    def log_entry(self, level, message):
+        """Log entry with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        self.log.append(entry)
+        print(entry)
+    
+    def read_policy_file(self):
+        """Read policy file"""
+        try:
+            with open(self.policy_file, 'r') as f:
+                return f.read()
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to read policy file: {e}")
+            return None
+    
+    def extract_clauses_with_gemini(self, content):
+        """
+        Use Gemini API to extract individual clauses from raw policy text.
+        Each clause should contain:
+        - clause_id (C1, C2, C3, etc.)
+        - Elaborated text (4-5 lines max) with:
+          * Conditional statements (IF/THEN logic)
+          * Numerical values (amounts, percentages, thresholds)
+          * Clear enforcement intent
+          * Referenced source section
+        
+        Returns:
+            list: Array of clause dicts with clause_id → text mapping (linked list style)
+        """
+        
+        self.log_entry("GEMINI", "Extracting and elaborating clauses from policy")
+        
+        prompt = f"""
+You are a POLICY CLAUSE EXTRACTION ENGINE. Your task is to break down a policy document into 
+ATOMIC, ELABORATED CLAUSES that can be linked together (linked-list structure where each 
+clause_id points to detailed text).
+
+CRITICAL REQUIREMENTS:
+====================
+1. Each clause must be SELF-CONTAINED but reference other clauses if needed
+2. Each clause text should be 4-5 lines MAXIMUM with elaborated details
+3. MUST include:
+   - Conditional statements (IF condition THEN consequence)
+   - Numerical values (amounts, percentages, durations, thresholds)
+   - Enforcement level (MUST/SHOULD/MAY)
+   - Applicable roles or conditions
+4. Clauses form a LINKED-LIST (later clauses can reference earlier ones)
+5. NO interpretation - extract exactly what the policy states
+6. Preserve original clause numbering/section references from source
+
+POLICY DOCUMENT:
+================================================================================
+{content}
+================================================================================
+
+OUTPUT FORMAT (JSON array only - no other text):
+[
+  {{
+    "clause_id": "C1",
+    "text": "4-5 line elaborated text with all details. Include IF/THEN, amounts, thresholds, 
+             roles, enforcement level. If references previous clause, cite it as (refs: C0). 
+             Source: Section X, Paragraph Y."
+  }},
+  {{
+    "clause_id": "C2",
+    "text": "Next clause elaborated with conditional logic, numerical values, and enforcement intent..."
+  }}
+]
+
+ELABORATION RULES:
+==================
+- Expand vague terms with inferred context
+- Make implicit conditions explicit (e.g., "after 4:30 PM" → "IF time >= 16:30 THEN...")
+- Convert amounts to explicit values (e.g., "$500 per diem" → "Daily allowance: 500 USD")
+- State role/grade applicability explicitly
+- Flag cross-references between clauses with (refs: C#)
+- Mark enforcement level: MUST (mandatory), SHOULD (recommended), MAY (optional)
+
+LINKED-LIST BEHAVIOR:
+=====================
+- First clause (C1) stands alone
+- Subsequent clauses can reference earlier clauses like: (refs: C1, C3)
+- Build a logical chain of policy enforcement
+- Ensure each clause can be evaluated independently AND in sequence
+
+OUTPUT ONLY the JSON array. No explanations, no markdown, no code blocks.
+"""
+        
+        try:
+            self.log_entry("GEMINI_REQUEST", "Sending policy content for clause extraction")
+            response = self.model.generate_content(prompt)
+            
+            response_text = response.text.strip()
+            
+            # Remove markdown code blocks if present
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]  # Remove ```json
+            if response_text.startswith("```"):
+                response_text = response_text[3:]  # Remove ```
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]  # Remove trailing ```
+            
+            response_text = response_text.strip()
+            
+            # Parse JSON response
+            try:
+                clauses = json.loads(response_text)
+                
+                if not isinstance(clauses, list):
+                    self.log_entry("ERROR", "Gemini response is not a JSON array")
+                    return None
+                
+                self.log_entry("SUCCESS", f"Extracted {len(clauses)} clauses from policy")
+                return clauses
+                
+            except json.JSONDecodeError as e:
+                self.log_entry("ERROR", f"Failed to parse Gemini JSON response: {e}")
+                self.log_entry("DEBUG", f"Response preview: {response_text[:200]}")
+                return None
+        
+        except Exception as e:
+            self.log_entry("ERROR", f"Gemini API failed: {e}")
+            return None
+    
+    def validate_clauses(self, clauses):
+        """Validate extracted clauses structure"""
+        if not clauses:
+            return False
+        
+        for i, clause in enumerate(clauses):
+            # Check required fields
+            if "clause_id" not in clause or "text" not in clause:
+                self.log_entry("ERROR", f"Clause {i} missing required fields (clause_id, text)")
+                return False
+            
+            # Check text length (4-5 lines recommendation, allow up to 10)
+            text_lines = len(clause["text"].split('\n'))
+            if text_lines > 15:
+                self.log_entry("WARNING", f"Clause {clause['clause_id']} exceeds recommended length ({text_lines} lines)")
+            
+            # Validate clause_id format
+            if not re.match(r'^C\d+$', clause['clause_id']):
+                self.log_entry("ERROR", f"Invalid clause_id format: {clause['clause_id']} (should be C1, C2, etc.)")
+                return False
+        
+        return True
+    
+    def build_clause_map(self, clauses):
+        """
+        Build simple clause_id → text mapping (no linked-list pointers).
+        Each clause_id is directly linked to its elaborated text.
+        Used as input for Stage 2 intent classification.
+        """
+        clause_map = []
+        for clause in clauses:
+            clause_map.append({
+                "clauseId": clause["clause_id"],
+                "text": clause["text"]
+            })
+        return clause_map
+    
+    def format_clauses_output(self, clauses):
+        """
+        Format clause output with metadata header for Stage 2 (intent classification).
+        Simple structure: clauseId → text mapping.
+        
+        Args:
+            clauses (list): List of clause dicts with clauseId and text
+            
+        Returns:
+            dict: Formatted output with metadata and clauses array
+        """
+        output = {
+            "metadata": {
+                "generated": datetime.now().isoformat(),
+                "source": self.policy_file,
+                "format": "Clause → Text Mapping (Stage 1B → Stage 2 Intent Classification)",
+                "total_clauses": len(clauses),
+                "stage": "1B",
+                "next_stage": "2 - Intent Classification"
+            },
+            "clauses": clauses
+        }
+        return output
+    
+    def extract(self):
+        """Main extraction workflow"""
+        self.log_entry("START", "Step 1B: Clause Extraction with Elaboration")
+        
+        # Step 1: Read policy file
+        self.log_entry("STEP", "Reading policy file")
+        content = self.read_policy_file()
+        if not content:
+            return False
+        
+        self.log_entry("SUCCESS", f"Policy file read: {len(content)} characters")
+        
+        # Step 2: Extract and elaborate clauses with Gemini
+        self.log_entry("STEP", "Extracting and elaborating clauses with Gemini")
+        clauses = self.extract_clauses_with_gemini(content)
+        if not clauses:
+            return False
+        
+        # Step 3: Validate clauses
+        self.log_entry("STEP", "Validating clause structure")
+        if not self.validate_clauses(clauses):
+            return False
+        
+        # Step 4: Build clause_id → text mapping (simple link, no pointers)
+        self.log_entry("STEP", "Building clause_id → text mapping")
+        clause_map = self.build_clause_map(clauses)
+        
+        # Step 5: Format output
+        self.log_entry("STEP", "Formatting output")
+        formatted_output = self.format_clauses_output(clause_map)
+        
+        # Step 6: Save to file
+        try:
+            with open(self.clauses_file, 'w') as f:
+                json.dump(formatted_output, f, indent=2)
+            
+            self.log_entry("SUCCESS", f"Clauses saved to: {self.clauses_file}")
+            self.log_entry("STATS", f"Total clauses: {len(clause_map)}")
+            
+            return True
+            
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save clauses file: {e}")
+            return False
+    
+    def save_log(self):
+        """Append log to mechanism.log"""
+        with open(LOG_FILE, 'a') as f:
+            f.write("\n\n=== CLAUSE EXTRACTION LOG ===\n")
+            f.write(f"Timestamp: {datetime.now()}\n")
+            f.write("="*50 + "\n\n")
+            for entry in self.log:
+                f.write(entry + "\n")
+
+
+class IntentClassifier:
+    """
+    Step 2: Classify clause intents using Gemini API.
+    
+    For each clause text from Stage 1B, determines the intent type and confidence.
+    Intent types: RESTRICTION, LIMIT, CONDITIONAL_ALLOWANCE, EXCEPTION,
+                  APPROVAL_REQUIRED, ADVISORY, INFORMATIONAL
+    """
+    
+    def __init__(self, clauses_file):
+        self.clauses_file = clauses_file
+        self.classified_file = f"{OUTPUT_DIR}/stage2_classified.json"
+        self.log = []
+        
+        # Initialize Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemma-3-27b-it')
+        
+        # Allowed intents (hardcoded taxonomy)
+        self.allowed_intents = [
+            "RESTRICTION",
+            "LIMIT",
+            "CONDITIONAL_ALLOWANCE",
+            "EXCEPTION",
+            "APPROVAL_REQUIRED",
+            "ADVISORY",
+            "INFORMATIONAL"
+        ]
+    
+    def log_entry(self, level, message):
+        """Log entry with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        self.log.append(entry)
+        print(entry)
+    
+    def read_clauses_file(self):
+        """Read stage1_clauses.json and extract clauses array"""
+        try:
+            with open(self.clauses_file, 'r') as f:
+                data = json.load(f)
+            
+            if "clauses" not in data:
+                self.log_entry("ERROR", "No 'clauses' array found in input file")
+                return None
+            
+            clauses = data["clauses"]
+            if not isinstance(clauses, list):
+                self.log_entry("ERROR", "Clauses is not a list")
+                return None
+            
+            self.log_entry("SUCCESS", f"Read {len(clauses)} clauses from {self.clauses_file}")
+            return clauses
+        
+        except json.JSONDecodeError as e:
+            self.log_entry("ERROR", f"Failed to parse JSON: {e}")
+            return None
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to read clauses file: {e}")
+            return None
+    
+    def classify_intent_with_gemini(self, clause_id, clause_text):
+        """
+        Use Gemini API to classify a single clause's intent.
+        
+        Args:
+            clause_id (str): Clause identifier (C1, C2, etc.)
+            clause_text (str): Elaborated clause text
+            
+        Returns:
+            dict: { "intent": "...", "confidence": 0.0-1.0, "reasoning": "..." }
+        """
+        
+        prompt = f"""
+You are a POLICY INTENT CLASSIFIER. Analyze the clause text and determine its intent type.
+
+ALLOWED INTENT TYPES (MUST choose exactly one):
+1. RESTRICTION - Prohibits or forbids an action; what must NOT be done
+2. LIMIT - Sets maximum/minimum thresholds, caps, or quantitative bounds
+3. CONDITIONAL_ALLOWANCE - IF/THEN entitlements; allowances based on conditions
+4. EXCEPTION - Special cases, exemptions, or deviations from general rules
+5. APPROVAL_REQUIRED - Requires authorization, permission, or sign-off
+6. ADVISORY - Recommended behavior; non-mandatory; SHOULD/MAY language
+7. INFORMATIONAL - Definitions, classifications, or reference information
+
+CLAUSE TO CLASSIFY:
+Clause ID: {clause_id}
+Text: "{clause_text}"
+
+ANALYSIS TASK:
+1. Identify the primary intent of this clause
+2. Determine confidence (0.0-1.0) based on clarity and explicitness
+3. Provide brief reasoning
+
+OUTPUT FORMAT (strict JSON, one line):
+{{
+  "intent": "INTENT_TYPE",
+  "confidence": 0.0-1.0,
+  "reasoning": "Brief explanation of why this intent was chosen"
+}}
+
+Guidelines:
+- RESTRICTION: "must NOT", "prohibited", "not allowed", "cannot", "forbidden"
+- LIMIT: "maximum", "minimum", "cap", "threshold", "up to", "at most", "at least"
+- CONDITIONAL_ALLOWANCE: "IF...THEN", "eligible if", "provided that", "when", "upon"
+- EXCEPTION: "except", "unless", "provided", "in case of", "special case"
+- APPROVAL_REQUIRED: "requires approval", "must be approved", "needs authorization"
+- ADVISORY: "should", "may", "recommended", "preferred", "suggested"
+- INFORMATIONAL: "defined as", "classified as", "includes", "consists of", "types"
+
+Output ONLY valid JSON. No explanation outside the JSON object.
+"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            response_text = response.text.strip()
+            
+            # Clean markdown if present
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            # Parse JSON
+            try:
+                result = json.loads(response_text)
+                
+                # Validate intent
+                if "intent" not in result:
+                    self.log_entry("WARNING", f"{clause_id}: Missing 'intent' field")
+                    result["intent"] = "INFORMATIONAL"  # Default fallback
+                
+                # Validate intent is in allowed list
+                intent = result.get("intent", "INFORMATIONAL").upper()
+                if intent not in self.allowed_intents:
+                    self.log_entry("WARNING", f"{clause_id}: Invalid intent '{intent}', using INFORMATIONAL")
+                    result["intent"] = "INFORMATIONAL"
+                else:
+                    result["intent"] = intent
+                
+                # Validate confidence
+                if "confidence" not in result:
+                    result["confidence"] = 0.75  # Default confidence
+                else:
+                    try:
+                        conf = float(result["confidence"])
+                        result["confidence"] = max(0.0, min(1.0, conf))  # Clamp 0-1
+                    except (ValueError, TypeError):
+                        result["confidence"] = 0.75
+                
+                return result
+            
+            except json.JSONDecodeError as e:
+                self.log_entry("ERROR", f"{clause_id}: Failed to parse Gemini response: {e}")
+                return {
+                    "intent": "INFORMATIONAL",
+                    "confidence": 0.5,
+                    "reasoning": "Failed to parse response"
+                }
+        
+        except Exception as e:
+            self.log_entry("ERROR", f"{clause_id}: Gemini API call failed: {e}")
+            return {
+                "intent": "INFORMATIONAL",
+                "confidence": 0.5,
+                "reasoning": f"API error: {str(e)[:50]}"
+            }
+    
+    def classify(self):
+        """Main classification workflow"""
+        self.log_entry("START", "Step 2: Intent Classification")
+        
+        # Step 1: Read clauses from Stage 1B
+        self.log_entry("STEP", "Reading clauses from Stage 1B")
+        clauses = self.read_clauses_file()
+        if not clauses:
+            return False
+        
+        self.log_entry("STATS", f"Total clauses to classify: {len(clauses)}")
+        
+        # Step 2: Classify each clause
+        self.log_entry("STEP", "Classifying intent for each clause")
+        classified = []
+        
+        for i, clause in enumerate(clauses, 1):
+            clause_id = clause.get("clauseId", f"C{i}")
+            clause_text = clause.get("text", "")
+            
+            self.log_entry("CLASSIFY", f"[{i}/{len(clauses)}] Processing {clause_id}")
+            
+            # Classify this clause
+            intent_result = self.classify_intent_with_gemini(clause_id, clause_text)
+            
+            # Build classified clause record
+            classified_clause = {
+                "clauseId": clause_id,
+                "text": clause_text,
+                "intent": intent_result.get("intent", "INFORMATIONAL"),
+                "confidence": intent_result.get("confidence", 0.5),
+                "reasoning": intent_result.get("reasoning", "")
+            }
+            
+            classified.append(classified_clause)
+            
+            self.log_entry("RESULT", f"{clause_id}: {classified_clause['intent']} (confidence: {classified_clause['confidence']})")
+        
+        self.log_entry("SUCCESS", f"Classified {len(classified)} clauses")
+        
+        # Step 3: Format output
+        self.log_entry("STEP", "Formatting classified output")
+        formatted_output = self.format_classified_output(classified)
+        
+        # Step 4: Save to file
+        try:
+            with open(self.classified_file, 'w') as f:
+                json.dump(formatted_output, f, indent=2)
+            
+            self.log_entry("SUCCESS", f"Classified clauses saved to: {self.classified_file}")
+            return True
+        
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save classified file: {e}")
+            return False
+    
+    def format_classified_output(self, classified_clauses):
+        """
+        Format classified output with metadata.
+        
+        Args:
+            classified_clauses (list): List of classified clause dicts
+            
+        Returns:
+            dict: Formatted output with metadata and classified clauses
+        """
+        # Calculate statistics
+        intent_counts = {}
+        for clause in classified_clauses:
+            intent = clause.get("intent", "UNKNOWN")
+            intent_counts[intent] = intent_counts.get(intent, 0) + 1
+        
+        avg_confidence = sum(c.get("confidence", 0) for c in classified_clauses) / len(classified_clauses) if classified_clauses else 0
+        
+        output = {
+            "metadata": {
+                "generated": datetime.now().isoformat(),
+                "source": self.clauses_file,
+                "format": "Intent Classification (Stage 2)",
+                "total_clauses": len(classified_clauses),
+                "stage": "2",
+                "next_stage": "3 - Payload Evaluation",
+                "average_confidence": round(avg_confidence, 3),
+                "intent_distribution": intent_counts
+            },
+            "classified_clauses": classified_clauses
+        }
+        return output
+    
+    def save_log(self):
+        """Append log to mechanism.log"""
+        with open(LOG_FILE, 'a') as f:
+            f.write("\n\n=== INTENT CLASSIFICATION LOG ===\n")
+            f.write(f"Timestamp: {datetime.now()}\n")
+            f.write("="*50 + "\n\n")
+            for entry in self.log:
+                f.write(entry + "\n")
+
+
+class EntityExtractor:
+    """
+    Step 3: Extract structured entities & thresholds using Gemini API.
+    
+    For each clause text from Stage 2, extracts explicit entities only.
+    Entity types: Type, Class, Category, amount, Currency, Hours, location, role, ApprovalAuthority
+    """
+    
+    def __init__(self, classified_file):
+        self.classified_file = classified_file
+        self.entities_file = f"{OUTPUT_DIR}/stage3_entities.json"
+        self.log = []
+        
+        # Initialize Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemma-3-27b-it')
+    
+    def log_entry(self, level, message):
+        """Log entry with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        self.log.append(entry)
+        print(entry)
+    
+    def read_classified_file(self):
+        """Read stage2_classified.json and extract classified clauses"""
+        try:
+            with open(self.classified_file, 'r') as f:
+                data = json.load(f)
+            
+            if "classified_clauses" not in data:
+                self.log_entry("ERROR", "No 'classified_clauses' array found in input file")
+                return None
+            
+            clauses = data["classified_clauses"]
+            if not isinstance(clauses, list):
+                self.log_entry("ERROR", "Classified clauses is not a list")
+                return None
+            
+            self.log_entry("SUCCESS", f"Read {len(clauses)} classified clauses from {self.classified_file}")
+            return clauses
+        
+        except json.JSONDecodeError as e:
+            self.log_entry("ERROR", f"Failed to parse JSON: {e}")
+            return None
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to read classified file: {e}")
+            return None
+    
+    def extract_entities_with_gemini(self, clause_id, clause_text):
+        """
+        Use Gemini API to extract entities dynamically from a single clause.
+        Entities are NOT predefined - LLM identifies meaningful key-value pairs.
+        
+        Args:
+            clause_id (str): Clause identifier (C1, C2, etc.)
+            clause_text (str): Clause text with policy content
+            
+        Returns:
+            dict: { "entityName": value, ... } with dynamically identified entities
+        """
+        
+        prompt = f"""
+You are a DYNAMIC ENTITY EXTRACTION ENGINE. Extract meaningful structured entities from policy text.
+
+CRITICAL RULES:
+1. Extract ONLY values explicitly stated in the text
+2. Do NOT infer, guess, or assume missing values
+3. Do NOT include null/empty values - omit if not present
+4. Preserve original units (currency, time, amounts, etc.)
+5. Create entity names that are descriptive and meaningful
+6. One clause may have multiple entity values
+
+ENTITY EXTRACTION GUIDELINES:
+- Identify key-value pairs that represent measurable facts
+- Entity names should be descriptive (e.g., "dailyAllowance", "travelDuration", "approvalAuthority")
+- Include units in values when present (e.g., "7.0 Rs/KM", "15 days", "100 KM")
+- Group related values logically
+- Use camelCase for multi-word entity names
+
+CLAUSE TO ANALYZE:
+Clause ID: {clause_id}
+Text: "{clause_text}"
+
+EXTRACTION TASK:
+1. Scan clause text for explicit, measurable values
+2. Identify meaningful entity names based on context
+3. Extract only what is clearly stated
+4. Omit entities not explicitly mentioned
+5. Return a JSON object with extracted entities
+
+OUTPUT FORMAT (valid JSON object, empty if no entities):
+{{
+  "descriptiveEntityName1": "value1",
+  "descriptiveEntityName2": "value2"
+}}
+
+EXAMPLES:
+- Text: "Rs. 7.0 per KM for Four Wheeler or Rs. 2.5 per KM for Two Wheeler"
+  Extract: {{"fourWheelerRate": "7.0 Rs/KM", "twoWheelerRate": "2.5 Rs/KM"}}
+
+- Text: "Employee grade M1-M6 with corresponding lodging amounts"
+  Extract: {{"employeeGrades": "M1-M6", "lodgingVariation": "grade-dependent"}}
+
+- Text: "Bills MUST be submitted within 15 days"
+  Extract: {{"billSubmissionDeadline": "15 days"}}
+
+- Text: "Requires HOD approval for direct booking"
+  Extract: {{"requiredApproval": "HOD"}}
+
+- Text: "Travel to NCR, Mumbai, Delhi"
+  Extract: {{"allowedCities": "NCR, Mumbai, Delhi"}}
+
+- If text has no measurable values, return: {{}}
+
+Output ONLY valid JSON. No explanation outside JSON.
+"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            response_text = response.text.strip()
+            
+            # Clean markdown if present
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            # Parse JSON
+            try:
+                result = json.loads(response_text)
+                
+                if not isinstance(result, dict):
+                    self.log_entry("WARNING", f"{clause_id}: Result is not a dict, using empty")
+                    return {}
+                
+                # Return all entities as-is (fully dynamic, no validation against predefined list)
+                return result
+            
+            except json.JSONDecodeError as e:
+                self.log_entry("ERROR", f"{clause_id}: Failed to parse Gemini response: {e}")
+                return {}
+        
+        except Exception as e:
+            self.log_entry("ERROR", f"{clause_id}: Gemini API call failed: {e}")
+            return {}
+    
+    def extract(self):
+        """Main extraction workflow"""
+        self.log_entry("START", "Step 3: Entity & Threshold Extraction")
+        
+        # Step 1: Read classified clauses from Stage 2
+        self.log_entry("STEP", "Reading classified clauses from Stage 2")
+        clauses = self.read_classified_file()
+        if not clauses:
+            return False
+        
+        self.log_entry("STATS", f"Total clauses to extract entities from: {len(clauses)}")
+        
+        # Step 2: Extract entities from each clause
+        self.log_entry("STEP", "Extracting entities from each clause")
+        extracted = []
+        
+        for i, clause in enumerate(clauses, 1):
+            clause_id = clause.get("clauseId", f"C{i}")
+            clause_text = clause.get("text", "")
+            clause_intent = clause.get("intent", "UNKNOWN")
+            
+            self.log_entry("EXTRACT", f"[{i}/{len(clauses)}] Processing {clause_id}")
+            
+            # Extract entities from this clause
+            entities = self.extract_entities_with_gemini(clause_id, clause_text)
+            
+            # Build extracted clause record
+            extracted_clause = {
+                "clauseId": clause_id,
+                "text": clause_text,
+                "intent": clause_intent,
+                "entities": entities
+            }
+            
+            extracted.append(extracted_clause)
+            
+            entity_count = len(entities)
+            self.log_entry("RESULT", f"{clause_id}: Extracted {entity_count} entities: {list(entities.keys())}")
+        
+        self.log_entry("SUCCESS", f"Extracted entities from {len(extracted)} clauses")
+        
+        # Step 3: Calculate statistics
+        self.log_entry("STEP", "Calculating entity statistics")
+        stats = self.calculate_entity_statistics(extracted)
+        
+        # Step 4: Format output
+        self.log_entry("STEP", "Formatting entity extraction output")
+        formatted_output = self.format_entities_output(extracted, stats)
+        
+        # Step 5: Save to file
+        try:
+            with open(self.entities_file, 'w') as f:
+                json.dump(formatted_output, f, indent=2)
+            
+            self.log_entry("SUCCESS", f"Extracted entities saved to: {self.entities_file}")
+            return True
+        
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save entities file: {e}")
+            return False
+    
+    def calculate_entity_statistics(self, extracted_clauses):
+        """
+        Calculate entity extraction statistics.
+        
+        Args:
+            extracted_clauses (list): List of extracted clause dicts
+            
+        Returns:
+            dict: Statistics about entities
+        """
+        entity_counts = {}
+        total_entities = 0
+        clauses_with_entities = 0
+        
+        for clause in extracted_clauses:
+            entities = clause.get("entities", {})
+            if entities:
+                clauses_with_entities += 1
+            
+            for entity_type in entities.keys():
+                entity_counts[entity_type] = entity_counts.get(entity_type, 0) + 1
+                total_entities += 1
+        
+        return {
+            "total_entities": total_entities,
+            "total_clauses": len(extracted_clauses),
+            "clauses_with_entities": clauses_with_entities,
+            "entity_type_distribution": entity_counts,
+            "coverage": round(clauses_with_entities / len(extracted_clauses) * 100, 1) if extracted_clauses else 0
+        }
+    
+    def format_entities_output(self, extracted_clauses, stats):
+        """
+        Format entity extraction output with metadata.
+        
+        Args:
+            extracted_clauses (list): List of extracted clause dicts
+            stats (dict): Entity statistics
+            
+        Returns:
+            dict: Formatted output with metadata and extracted entities
+        """
+        # Collect all unique entity names found across clauses
+        entity_names = set()
+        for clause in extracted_clauses:
+            for entity_name in clause.get("entities", {}).keys():
+                entity_names.add(entity_name)
+        
+        output = {
+            "metadata": {
+                "generated": datetime.now().isoformat(),
+                "source": self.classified_file,
+                "format": "Dynamic Entity & Threshold Extraction (Stage 3)",
+                "total_clauses": len(extracted_clauses),
+                "stage": "3",
+                "next_stage": "4 - Payload Validation",
+                "statistics": stats,
+                "note": "Entity types are dynamically extracted - not predefined. Each entity name is derived from the clause context."
+            },
+            "extracted_entity_names": sorted(list(entity_names)),
+            "extracted_clauses": extracted_clauses
+        }
+        return output
+    
+    def save_log(self):
+        """Append log to mechanism.log"""
+        with open(LOG_FILE, 'a') as f:
+            f.write("\n\n=== ENTITY EXTRACTION LOG ===\n")
             f.write(f"Timestamp: {datetime.now()}\n")
             f.write("="*50 + "\n\n")
             for entry in self.log:
@@ -151,156 +976,229 @@ class RuleExtractor:
         return structure
     
     def extract_rules_with_gemini(self, content):
-       """Use Gemini API to extract structured rules in Drools format"""
-       self.log_entry("GEMINI", "Initializing Gemini API for Drools rule extraction")
-       
-       # Build prompt for Drools rule extraction with advanced patterns
-       prompt = f"""Analyze this policy document and convert ALL policies into Drools rule format.
+        """
+        Use Gemini API to extract structured policy rules in Refactored Rule Engine format.
+        Works with ANY policy document - automatically infers structure and requirements.
 
-       Policy Document:
-       {content}
+        Returns:
+            str: Structured rules text or None if extraction failed.
+        """
 
-       TASK: Convert policies to Drools rules using this EXACT format:
+        self.log_entry("GEMINI", "Initializing Gemini API for structured rule extraction")
 
-       ```drools
-       rule "Rule Name"
-       when
-       // Conditions (facts and constraints)
-       FactType(attribute == value, attribute2 > value2)
-       AnotherFact(condition)
-       then
-       // Actions based on enforcement level
-       // For MUST: Set violations, errors, compliance status
-       // For EXPECTED: Set warnings, approval flags  
-       // For SHOULD: Set recommendations, best practice flags
-       action1();
-       action2();
-       update(fact);
-       end
-       ```
+        prompt = f"""
+You are a STRUCTURED POLICY EXTRACTION ENGINE with strict enforcement of logical rigor.
 
-       REQUIRED DROOLS ELEMENTS:
-       1. rule "Clear Descriptive Name": Use the policy title or specific condition scenario
-       2. when clause: Define conditions using facts (objects with attributes)
-       - Use fact types like: Employee, TravelBooking, Flight, TravelExpense, Document, Policy, etc.
-       - Use operators: ==, !=, <, >, <=, >=, contains, matches
-       - Bind facts to variables using $: $employee : Employee(status == 'ACTIVE')
-       - Support null checks and collection queries
-       3. then clause: Define actions with validation logic
-       - For MUST rules: setViolation(true), addError('message'), setComplianceStatus('NON_COMPLIANT')
-       - For EXPECTED: setRequiresApproval(true), addWarning('message')
-       - For SHOULD: addRecommendation('message'), setComplianceStatus('PENDING')
-       - Include conditional actions (if/else) for validation logic
-       - Always call update($fact) to persist changes
-       4. end: Close each rule
+Task:
+- Analyze the policy document below and extract ALL rules, requirements, entitlements, and constraints.
+- Output in the REFACTORED RULE ENGINE FORMAT (see below).
+- Make NO assumptions about the policy domain - infer structure from actual content.
+- ENFORCE: Every rule must have measurable conditions and verifiable consequences.
+- ENFORCE: All percentages, amounts, times, and durations must be explicit.
+- ENFORCE: Flag vague terms and provide concrete alternatives.
+- Output ONLY the structured rules - no commentary, explanations, or metadata outside the format.
 
-       EXTRACTION GUIDELINES:
-       1. Extract EVERY policy, requirement, and rule from the document
-       2. Identify enforcement level: MUST (mandatory/hard stop), EXPECTED (should comply), SHOULD (guideline)
-       3. Map policy attributes to Drools facts (create logical fact types as needed)
-       4. Convert prose conditions into boolean logic with clear operators and thresholds
-       5. Translate policy consequences into Drools actions with validation
-       6. Create multiple specific rules if a policy has multiple conditions, thresholds, or exception paths
-       7. Include exception handling rules for business justifications or special approvals
+====================================================
+POLICY DOCUMENT
+====================================================
+{content}
 
-       PATTERN 1 - Specific Thresholds & Conditions:
-       rule "Flight Class - International - Over 6 Hours - Business"
-       when
-       $flight : Flight(duration > 6, isInternational == true)
-       $traveler : Employee(role != 'SET_MEMBER', role != 'BOARD_MEMBER')
-       then
-       $flight.setAllowedClass('BUSINESS');
-       if ($flight.getBookedClass() != 'BUSINESS' && $flight.getBookedClass() != 'ECONOMY') {{
-       $flight.addError('Invalid class selection for international flights over 6 hours');
-       }}
-       update($flight);
-       end
+====================================================
+REFACTORED RULE ENGINE FORMAT
+====================================================
 
-       PATTERN 2 - Validation Logic with Compliance Status:
-       rule "Corporate Card - Mandatory Payment - Validation"
-       when
-       $expense : TravelExpense(paymentMethod != 'CORPORATE_CARD', amount > 0)
-       $traveler : Employee()
-       then
-       $expense.setViolation(true);
-       $expense.addError('MUST use Corporate Card for all business travel expenses');
-       $expense.setComplianceStatus('NON_COMPLIANT');
-       update($expense);
-       end
+SECTION 1: DEFINITIONS & CONSTANTS
+Define all key terms, enumerations, grades, roles, categories, and thresholds mentioned in the policy.
+Example:
+  employee.grade: {{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, Director, MD}}
+  travel.duration_threshold: {{short: 1-10 days, long: 11+ days}}
+  daily_allowance: {{E1-E7: 300 USD, E8-E10: 350 USD, MD: 500 USD}}
 
-       PATTERN 3 - Exception Handling with Approval:
-       rule "Advance Booking - Exception for Business Need"
-       when
-       $booking : TravelBooking(daysInAdvance < 14, hasBusinessJustification == true)
-       $manager : Employee(role == 'LINE_MANAGER', approved == true)
-       then
-       $booking.setExceptionApproved(true);
-       $booking.addNote('Exception approved due to business need');
-       update($booking);
-       end
+SECTION 2: AUTHORITY HIERARCHY (if applicable)
+Define approval authorities, decision-makers, and escalation paths with explicit role definitions.
+Example:
+  approval.travel_sanction: {{"authority": "MD & CEO", "required": true}}
+  approval.extended_stay: {{"authority": "E8 or higher", "exceptions": ["medical exigencies"]}}
 
-       PATTERN 4 - Domestic vs International & Duration Rules:
-       rule "Flight Class - Domestic - Any Duration - Economy"
-       when
-       $flight : Flight(isInternational == false)
-       $traveler : Employee()
-       then
-       $flight.setAllowedClass('ECONOMY');
-       if ($flight.getBookedClass() != 'ECONOMY') {{
-       $flight.addWarning('Domestic flights must be booked in ECONOMY class');
-       }}
-       update($flight);
-       end
+SECTION 3: PRIMARY ENTITLEMENTS OR RULES
+Organize by major policy domains/categories. For each rule use STRICT format:
 
-       PATTERN 5 - Multi-Factor Approval Rules:
-       rule "Premium Hotel - Requires Multi-Level Approval"
-       when
-       $booking : HotelBooking(starRating >= 4, costPerNight > 250)
-       $traveler : Employee(approvalLevel < 3)
-       then
-       $booking.setRequiresApproval(true);
-       $booking.setApprovalLevel(2);
-       $booking.addWarning('Premium hotel bookings require director-level approval');
-       update($booking);
-       end
+rule: <rule_name>
+priority: <1-high, 2-medium, 3-low>
+conditions:
+  - IF <measurable_condition_1> AND <measurable_condition_2>
+    THEN <verifiable_consequence_1>
+    AND <verifiable_consequence_2>
+    SOURCE: <clause reference>
 
-       ADVANCED FEATURES TO INCLUDE:
-       - Separate rules for MUST vs EXPECTED vs SHOULD enforcement
-       - Create threshold-based variations (e.g., < 14 days, 14-30 days, > 30 days)
-       - Include both violation and warning rules
-       - Add exception approval paths where applicable
-       - Use validation logic (if statements) to check for invalid combinations
-       - Set compliance status ('COMPLIANT', 'NON_COMPLIANT', 'PENDING', 'EXCEPTION_APPROVED')
-       - Include informative error/warning messages with specific guidance
-       - Create rules for both positive and negative conditions
+CRITICAL REQUIREMENTS FOR SECTION 3:
+  - Every condition must be verifiable (compare against defined constants)
+  - Every THEN must have a concrete, measurable outcome
+  - If condition contains %, that % must reference a base value defined in SECTION 1
+  - If condition contains time (e.g., "after 4:30 PM"), state EXACTLY what the trigger is
+  - If multiple rules could apply, state which takes precedence
 
-       Now extract ALL rules from the policy document above in Drools format, following all patterns and guidelines:"""
 
-       try:
-           self.log_entry("GEMINI_REQUEST", "Sending content for Drools rule generation")
-           response = self.model.generate_content(prompt)
-           
-           self.log_entry("GEMINI_RESPONSE", f"Received Drools rules, processing...")
-           return response.text
-           
-       except Exception as e:
-           self.log_entry("ERROR", f"Gemini API failed: {e}")
-           return None
-    
-    def format_rules_output(self, gemini_response):
-        """Format Gemini response as structured rules.txt"""
+SECTION 4: ANCILLARY RULES
+Optional behaviors, recommendations, special cases that are not mandatory.
+Mark as SHOULD/RECOMMENDED, not MUST.
+
+SECTION 5: PROHIBITED ITEMS
+What is explicitly forbidden with clear conditions.
+
+SECTION 6: MANDATORY REQUIREMENTS
+Pre-conditions that MUST be satisfied before any travel/entitlements activate.
+These are blocking conditions (no exceptions).
+
+SECTION 7: RULE PRECEDENCE & CONFLICT RESOLUTION
+Explicit rules for handling overlapping conditions:
+  - Which rule wins if multiple apply? (e.g., "Most restrictive rule applies")
+  - What if a rule contradicts another? (e.g., "Explicit exception overrides general rule")
+  - How are ambiguous conditions resolved? (e.g., "Escalate to 'x' for decision")
+  
+If NO conflict exists, state: "No overlapping rules identified in this policy."
+
+SECTION 8: MEASUREMENT & ENFORCEMENT
+For each vague term found, provide:
+  1. Original vague term
+  2. Why it's unmeasurable
+  3. Concrete metric to replace it
+  
+Example:
+  Vague: "judicious expenditure"
+  Reason: No objective threshold defined
+  Concrete: "Allowance capped at [grade-specific amount]. Outliers flagged if spend > 120% of cap."
+
+SECTION 9: POLICY MAINTENANCE
+Review cycle, dependencies, update procedures, external references.
+
+====================================================
+EXTRACTION GUIDELINES
+====================================================
+NAMING & TERMS:
+  - Use normalized domain terms consistently (e.g., employee.grade, booking.travel_class, fx.amount)
+  - Define all acronyms and abbreviations (e.g., "MEA" = Ministry of External Affairs)
+  - When policy references external documents, list them explicitly
+
+NUMERIC PRECISION:
+  - Make ALL numeric limits explicit: X USD, Y days, Z hours
+  - For ranges, express as: "min <= value <= max" or "E1-E7 grades (6 distinct grades)"
+  - For percentages, state: "X% of [base value defined in SECTION 1]"
+  - For time conditions, use 24-hour format: "after 16:30 (4:30 PM)" not "after 4:30 PM"
+
+LOGIC & CONDITIONS:
+  - Split complex multi-condition clauses into separate rules
+  - Use AND/OR explicitly (not implicit)
+  - For grade-based rules, handle overlaps: if both "E8" and "E8-E10" rules exist, which wins?
+  - If policy says "may", "should", "could", mark as optional (SECTION 4)
+  - If policy says "must", "require", "shall", mark as mandatory (SECTION 3 or 6)
+
+VAGUE TERM HANDLING:
+  - Do NOT output rules with unmeasurable terms
+  - Flag them in SECTION 8 instead
+  - Suggest concrete metrics
+  - Mark as PENDING MANUAL REVIEW if no metric can be inferred
+
+COMPLETENESS:
+  - Preserve clause/section numbers from source document
+  - If policy is silent on a scenario, do NOT invent it
+  - If policy contradicts itself, flag explicitly in SECTION 7
+
+====================================================
+OUTPUT STRUCTURE EXAMPLE
+====================================================
+
+================================================================================
+OVERSEAS BUSINESS TRAVEL - STRUCTURED RULES
+================================================================================
+Generated: 2026-01-15
+Source Policy Sections: 1-5
+Format: Rule Engine v1.0
+
+================================================================================
+1. DEFINITIONS & CONSTANTS
+================================================================================
+
+employee.grade:
+  junior: [E1, E2, E3, E4, E5, E6, E7]
+  senior: [E8, E9, E10]
+  executive: [Director, MD & CEO]
+
+daily_allowance_usd:
+  E1_to_E7: 300
+  E8_to_E10: 350
+  executive: 500
+
+travel_class_entitlement:
+  E1_to_E7: "Economy Class"
+  E8_to_E10: "Business Class"
+  Director: ["Business Class", "Club Class"]
+  MD_CEO: "First Class"
+
+================================================================================
+2. AUTHORITY HIERARCHY
+================================================================================
+
+approval.travel_sanction:
+  authority: "MD & CEO"
+  required: true
+  exceptions: none
+
+[etc...]
+
+====================================================
+CRITICAL: OUTPUT ONLY THE STRUCTURED RULES
+====================================================
+Do NOT include:
+- Explanatory text outside the format
+- Original policy paragraphs
+- Commentary or interpretation
+- Placeholder examples
+- Vague rules (move to SECTION 8 instead)
+
+Output must be ready to parse and implement as-is.
+Rules with unmeasurable conditions go to SECTION 8 for definition.
+"""
+
+        try:
+            self.log_entry("GEMINI_REQUEST", "Sending policy content for structured rule extraction")
+            response = self.model.generate_content(prompt)
+
+            rule_output = response.text.strip()
+            
+            # Validate output contains expected structure markers
+            if "DEFINITIONS & CONSTANTS" not in rule_output and "rule:" not in rule_output:
+                self.log_entry("WARNING", "Gemini response missing expected structure markers. Output may be incomplete.")
+            
+            self.log_entry("GEMINI_RESPONSE", "Structured rules extracted successfully")
+            
+            # Return raw output - formatting will be done by caller
+            return rule_output
+
+        except Exception as e:
+            self.log_entry("ERROR", f"Gemini API failed: {e}")
+            return None
+
+    def format_rules_output(self, gemini_output):
+        """
+        Wrap extracted rules with consistent header and metadata.
         
+        Args:
+            gemini_output (str): Raw output from Gemini
+            
+        Returns:
+            str: Formatted rules document
+        """
         output = "=" * 80 + "\n"
-        output += "POLICY EXTRACTION - COMPREHENSIVE RULES DATABASE\n"
+        output += "STRUCTURED POLICY RULES - EXTRACTED VIA GEMINI API\n"
         output += "=" * 80 + "\n\n"
         output += f"Generated: {datetime.now()}\n"
         output += f"Source: {self.policy_file}\n"
-        output += f"Extraction Method: Grep + Gemini API\n\n"
-        output += "=" * 80 + "\n"
-        output += "EXTRACTED POLICIES AND RULES\n"
+        output += f"Extraction Method: Content Analysis + Gemini Structured Extraction\n"
+        output += f"Format: Rule Engine v1.0 (Measurable, Enforceable, Generic)\n\n"
         output += "=" * 80 + "\n\n"
         
-        output += gemini_response
+        output += gemini_output
         
         return output
     
@@ -344,10 +1242,607 @@ class RuleExtractor:
             self.log_entry("ERROR", f"Failed to save rules file: {e}")
             return False
     
+    def extract_topics_and_scenarios(self, content):
+        """
+        Extract all meaningful topics/scenarios from policy document using Gemini.
+        Returns a structured list of topics with brief descriptions.
+        Focuses on actual policy domains, not section numbers.
+        """
+        self.log_entry("GEMINI", "Extracting topics and scenarios from policy")
+        
+        prompt = f"""
+You are a POLICY TOPICS EXTRACTION ENGINE. Your task is to identify MEANINGFUL POLICY DOMAINS.
+
+CRITICAL INSTRUCTIONS:
+=====================
+1. Extract ONLY meaningful topic names that represent policy domains/areas (e.g., "Travel Authorization", "Leave Entitlements", "Daily Allowances")
+2. DO NOT output section numbers alone (e.g., "4.1", "3.2", "12") - these are NOT topics
+3. DO NOT output generic items without clear policy meaning
+4. Each topic must represent a distinct policy domain with its own set of rules
+
+Task:
+- Analyze the policy document below and identify ALL major policy domains/categories
+- Extract topics that have their own separate rules, requirements, or guidelines
+- For each topic, provide a brief 1-2 line description of what it covers
+- Output as a numbered list with MEANINGFUL TOPIC NAME and description
+
+Policy Document:
+================================================================================
+{content}
+================================================================================
+
+OUTPUT FORMAT:
+Number each topic sequentially. Use this STRICT format:
+1. [Meaningful Topic Name] - Brief description (1-2 lines max) of what this policy area covers
+
+Example of CORRECT output:
+1. Daily Allowances - Consolidated foreign exchange amounts for employees by grade
+2. Leave Entitlements - Leave on duty and extended stay policies during overseas travel
+3. Travel Authorization - Approval process and authority hierarchy for overseas travel
+
+Example of INCORRECT output (NEVER do this):
+1. 4.1 - (DO NOT USE - section numbers are not topics)
+2. Item 12 - (DO NOT USE - generic numbers are not topics)
+3. Guidelines - (DO NOT USE - too vague without domain specification)
+
+COMPLETION CRITERIA:
+====================
+✓ ONLY extract topics that represent actual policy domains from the document
+✓ Each topic name must be descriptive and meaningful (e.g., "Travel Mode Entitlements", NOT "3.1")
+✓ Topic must have multiple rules or requirements in the policy
+✓ Preserve the exact topic names/domains as they appear conceptually in the policy
+✓ Output ONLY the numbered list - no explanations or metadata
+
+Output ONLY the numbered list. No additional text before or after.
+"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            topics_text = response.text.strip()
+            self.log_entry("GEMINI_RESPONSE", "Topics extracted successfully")
+            
+            # Validate that extracted topics are meaningful (not just numbers)
+            lines = topics_text.split('\n')
+            valid_topics = []
+            for line in lines:
+                line = line.strip()
+                if line and not line[0].isdigit():  # Skip empty or number-only lines
+                    # Check if line contains a meaningful topic name (not just numbers)
+                    if any(char.isalpha() for char in line):  # Must contain at least one letter
+                        valid_topics.append(line)
+            
+            if not valid_topics:
+                self.log_entry("WARNING", "No meaningful topics extracted. Using raw response.")
+                return topics_text
+            
+            # Reconstruct numbered list
+            formatted_topics = '\n'.join([f"{i+1}. {line.lstrip('0123456789.-) ')}" for i, line in enumerate(valid_topics)])
+            return formatted_topics
+            
+        except Exception as e:
+            self.log_entry("ERROR", f"Gemini API failed to extract topics: {e}")
+            return None
+    
+    def extract_rules_for_topic(self, content, topic_name):
+        """
+        Extract rules for a specific topic/scenario from the policy using the same
+        strict format as extract_rules_with_gemini.
+        
+        Args:
+            content (str): Full policy content
+            topic_name (str): Name of the topic to extract rules for
+            
+        Returns:
+            str: Formatted rules for the specific topic
+        """
+        self.log_entry("GEMINI", f"Extracting rules for topic: {topic_name}")
+        
+        prompt = f"""
+You are a STRUCTURED POLICY EXTRACTION ENGINE with strict enforcement of logical rigor.
+
+Task:
+- From the policy document below, extract ALL rules, requirements, entitlements, and constraints ONLY related to: "{topic_name}"
+- Output in the REFACTORED RULE ENGINE FORMAT (see below).
+- Make NO assumptions - only extract what exists for this topic.
+- ENFORCE: Every rule must have measurable conditions and verifiable consequences.
+- ENFORCE: All percentages, amounts, times, and durations must be explicit.
+- ENFORCE: Flag vague terms and provide concrete alternatives.
+- Output ONLY the structured rules - no commentary, explanations, or metadata outside the format.
+
+====================================================
+POLICY DOCUMENT
+====================================================
+{content}
+
+====================================================
+REFACTORED RULE ENGINE FORMAT FOR TOPIC: "{topic_name}"
+====================================================
+
+SECTION 1: DEFINITIONS & CONSTANTS
+Define all key terms, enumerations, grades, roles, categories, and thresholds specific to {topic_name}.
+Example:
+  employee.grade: {{E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, Director, MD}}
+  duration_threshold: {{short: 1-10 days, long: 11+ days}}
+  amount: {{junior: 300 USD, senior: 350 USD, executive: 500 USD}}
+
+SECTION 2: AUTHORITY HIERARCHY (if applicable)
+Define approval authorities, decision-makers, and escalation paths for {topic_name}.
+Example:
+  approval.required: {{"authority": "Manager", "required": true}}
+  escalation: {{"authority": "Director", "when": "amount > 500 USD"}}
+
+SECTION 3: PRIMARY ENTITLEMENTS OR RULES FOR {topic_name}
+Organize by major policy domains/categories. For each rule use STRICT format:
+
+rule: <rule_name>
+priority: <1-high, 2-medium, 3-low>
+conditions:
+  - IF <measurable_condition_1> AND <measurable_condition_2>
+    THEN <verifiable_consequence_1>
+    AND <verifiable_consequence_2>
+    SOURCE: <clause reference>
+
+CRITICAL REQUIREMENTS FOR SECTION 3:
+  - Every condition must be verifiable (compare against defined constants)
+  - Every THEN must have a concrete, measurable outcome
+  - If condition contains %, that % must reference a base value defined in SECTION 1
+  - If condition contains time (e.g., "after 4:30 PM"), state EXACTLY what the trigger is
+  - If multiple rules could apply, state which takes precedence
+
+SECTION 4: ANCILLARY RULES
+Optional behaviors, recommendations, special cases for {topic_name} that are not mandatory.
+Mark as SHOULD/RECOMMENDED, not MUST.
+
+SECTION 5: PROHIBITED ITEMS
+What is explicitly forbidden for {topic_name} with clear conditions.
+
+SECTION 6: MANDATORY REQUIREMENTS
+Pre-conditions that MUST be satisfied for {topic_name} entitlements to activate.
+These are blocking conditions (no exceptions).
+
+SECTION 7: RULE PRECEDENCE & CONFLICT RESOLUTION
+Explicit rules for handling overlapping conditions in {topic_name}:
+  - Which rule wins if multiple apply?
+  - What if a rule contradicts another?
+  - How are ambiguous conditions resolved?
+
+If NO conflict exists, state: "No overlapping rules identified for {topic_name}."
+
+SECTION 8: MEASUREMENT & ENFORCEMENT
+For each vague term found in {topic_name}, provide:
+  1. Original vague term
+  2. Why it's unmeasurable
+  3. Concrete metric to replace it
+
+Example:
+  Vague: "reasonable amount"
+  Reason: No objective threshold defined
+  Concrete: "Amount capped at grade-specific limit (defined in SECTION 1). Outliers flagged if spend > 120% of cap."
+
+SECTION 9: TOPIC SUMMARY
+Brief summary of what {topic_name} covers and any external dependencies or related topics.
+
+====================================================
+NAMING & TERMS:
+====================================================
+  - Use normalized domain terms consistently
+  - Define all acronyms and abbreviations
+  - When policy references external documents, list them explicitly
+
+NUMERIC PRECISION:
+====================================================
+  - Make ALL numeric limits explicit: X USD, Y days, Z hours
+  - For ranges, express as: "min <= value <= max"
+  - For percentages, state: "X% of [base value defined in SECTION 1]"
+  - For time conditions, use 24-hour format: "after 16:30 (4:30 PM)"
+
+LOGIC & CONDITIONS:
+====================================================
+  - Split complex multi-condition clauses into separate rules
+  - Use AND/OR explicitly (not implicit)
+  - If policy says "may", "should", "could", mark as optional (SECTION 4)
+  - If policy says "must", "require", "shall", mark as mandatory (SECTION 3 or 6)
+
+VAGUE TERM HANDLING:
+====================================================
+  - Do NOT output rules with unmeasurable terms
+  - Flag them in SECTION 8 instead
+  - Suggest concrete metrics
+  - Mark as PENDING MANUAL REVIEW if no metric can be inferred
+
+COMPLETENESS:
+====================================================
+  - Preserve clause/section numbers from source document
+  - If policy is silent on {topic_name}, state: "No rules found in policy for this topic."
+  - If policy contradicts itself, flag explicitly in SECTION 7
+
+====================================================
+CRITICAL: OUTPUT ONLY THE STRUCTURED RULES
+====================================================
+Do NOT include:
+- Explanatory text outside the format
+- Original policy paragraphs
+- Commentary or interpretation
+- Placeholder examples
+- Vague rules (move to SECTION 8 instead)
+
+Output must be ready to parse and implement as-is.
+Rules with unmeasurable conditions go to SECTION 8 for definition.
+"""
+        
+        try:
+            self.log_entry("GEMINI_REQUEST", f"Sending policy content for topic-specific structured rule extraction: {topic_name}")
+            response = self.model.generate_content(prompt)
+            rules_text = response.text.strip()
+            
+            # Validate output contains expected structure markers
+            if "SECTION 1:" not in rules_text and "rule:" not in rules_text:
+                self.log_entry("WARNING", f"Gemini response for '{topic_name}' missing expected structure markers. Output may be incomplete.")
+            
+            self.log_entry("GEMINI_RESPONSE", f"Rules for '{topic_name}' extracted successfully")
+            return rules_text
+        except Exception as e:
+            self.log_entry("ERROR", f"Gemini API failed to extract topic rules: {e}")
+            return None
+    
+    def format_topic_rules_output(self, gemini_output, topic_name):
+        """
+        Wrap extracted topic rules with consistent header and metadata.
+        
+        Args:
+            gemini_output (str): Raw output from Gemini
+            topic_name (str): Name of the topic
+            
+        Returns:
+            str: Formatted rules document for the topic
+        """
+        output = "=" * 80 + "\n"
+        output += f"STRUCTURED RULES FOR: {topic_name.upper()}\n"
+        output += "=" * 80 + "\n\n"
+        output += f"Generated: {datetime.now()}\n"
+        output += f"Source: {self.policy_file}\n"
+        output += f"Topic: {topic_name}\n"
+        output += f"Extraction Method: Topic-Specific Gemini Extraction\n"
+        output += f"Format: Rule Engine v1.0 (Measurable, Enforceable)\n\n"
+        output += "=" * 80 + "\n\n"
+        
+        output += gemini_output
+        
+        return output
+    
+    def save_topic_rules(self, formatted_rules, topic_name):
+        """
+        Save topic-specific rules to a separate file.
+        
+        Args:
+            formatted_rules (str): Formatted rules content
+            topic_name (str): Name of the topic
+            
+        Returns:
+            str: Path to saved file, or None if failed
+        """
+        # Create a safe filename from topic name
+        safe_topic_name = re.sub(r'[^a-zA-Z0-9_-]', '_', topic_name.lower())
+        topic_rules_file = f"{OUTPUT_DIR}/rules_{safe_topic_name}.txt"
+        
+        try:
+            with open(topic_rules_file, 'w') as f:
+                f.write(formatted_rules)
+            
+            self.log_entry("SUCCESS", f"Topic rules saved to: {topic_rules_file}")
+            self.log_entry("STATS", f"Output size: {len(formatted_rules)} characters")
+            
+            return topic_rules_file
+            
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save topic rules file: {e}")
+            return None
+
     def save_log(self):
         """Append log to mechanism.log"""
         with open(LOG_FILE, 'a') as f:
             f.write("\n\n=== RULE EXTRACTION LOG ===\n")
+            f.write(f"Timestamp: {datetime.now()}\n")
+            f.write("="*50 + "\n\n")
+            for entry in self.log:
+                f.write(entry + "\n")
+
+
+class ConfidenceAndRationaleGenerator:
+    """
+    Step 7: Generate confidence scores and rationale for each DSL rule.
+    
+    For each rule (clause):
+    - Explain why this rule was suggested from the source policy
+    - Cite the source clause reference
+    - Explain why it's enforceable
+    - Provide a confidence score (0.0-1.0) based on:
+      * Clarity of original clause (absence of ambiguities)
+      * Specificity of conditions
+      * Measurability of thresholds
+      * Cross-reference validation
+    
+    Output: stage7_confidence_rationale.json
+    """
+    
+    def __init__(self, stage5_file, stage6_file):
+        self.stage5_file = stage5_file  # Clarified clauses
+        self.stage6_file = stage6_file  # DSL rules
+        self.rationale_file = f"{OUTPUT_DIR}/stage7_confidence_rationale.json"
+        self.log = []
+        
+        # Initialize Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemma-3-27b-it')
+    
+    def log_entry(self, level, message):
+        """Log entry with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        self.log.append(entry)
+        print(entry)
+    
+    def read_json_file(self, filepath):
+        """Read and parse JSON file"""
+        try:
+            with open(filepath, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to read {filepath}: {e}")
+            return None
+    
+    def read_yaml_file(self, filepath):
+        """Read YAML rules file"""
+        try:
+            import yaml
+            with open(filepath, 'r') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to read YAML {filepath}: {e}")
+            return None
+    
+    def calculate_confidence_score(self, clause_data):
+        """
+        Calculate confidence score (0.0-1.0) based on:
+        - Absence of ambiguities (clause is clarified)
+        - Specificity of conditions
+        - Measurability of entities
+        - Enforcement clarity
+        
+        Args:
+            clause_data: Dict with clause info from stage5
+            
+        Returns:
+            float: Confidence score 0.0-1.0
+        """
+        score = 1.0
+        
+        # Penalty for ambiguities that were found and fixed
+        if "ambiguities_fixed" in clause_data:
+            ambiguities_fixed = clause_data["ambiguities_fixed"]
+            if ambiguities_fixed:
+                # Each fixed ambiguity reduces confidence by 0.05-0.15
+                penalty_per_ambiguity = {
+                    "SUBJECTIVE_LANGUAGE": 0.10,
+                    "UNDEFINED_REFERENCES": 0.15,
+                    "BOUNDARY_OVERLAPS": 0.12,
+                    "INCOMPLETE_CONDITIONS": 0.12,
+                    "VAGUE_METRICS": 0.12,
+                    "UNDEFINED_AUTHORITY": 0.10
+                }
+                
+                for ambiguity_type in ambiguities_fixed:
+                    penalty = penalty_per_ambiguity.get(ambiguity_type, 0.10)
+                    score -= penalty
+        
+        # Bonus for clear entity extraction
+        if "entities" in clause_data and clause_data["entities"]:
+            entity_count = len(clause_data["entities"])
+            # Bonus capped at 0.05
+            score += min(0.05, entity_count * 0.01)
+        
+        # Intent clarity bonus
+        if "intent" in clause_data:
+            intent = clause_data["intent"]
+            # RESTRICTION and CONDITIONAL_ALLOWANCE are more measurable
+            if intent in ["RESTRICTION", "CONDITIONAL_ALLOWANCE"]:
+                score += 0.05
+        
+        # Clamp between 0.0 and 1.0
+        return max(0.0, min(1.0, score))
+    
+    def build_local_rationale(self, clause_id, original_clause, clarified_clause, entities, ambiguities_fixed, intent):
+        """
+        Build rationale locally without Gemini API (avoids timeout issues).
+        
+        Args:
+            clause_id: Clause identifier
+            original_clause: Original clause text
+            clarified_clause: Clarified clause text
+            entities: Extracted entities
+            ambiguities_fixed: List of fixed ambiguities
+            intent: Clause intent (INFORMATIONAL, CONDITIONAL_ALLOWANCE, RESTRICTION)
+            
+        Returns:
+            str: Formatted rationale
+        """
+        
+        # Extract first sentence from original
+        orig_summary = original_clause.split('.')[0] if original_clause else "Policy requirement"
+        
+        # Build key entities list
+        entity_keys = list(entities.keys())[:5] if entities else []
+        entity_str = ", ".join(entity_keys) if entity_keys else "Standard policy terms"
+        
+        # Build ambiguity summary
+        if ambiguities_fixed:
+            ambig_summary = f"Fixed ambiguities: {', '.join(ambiguities_fixed[:3])}"
+        else:
+            ambig_summary = "Clear and unambiguous"
+        
+        # Intent-specific reasoning
+        intent_map = {
+            "CONDITIONAL_ALLOWANCE": "Rule specifies conditional allowances/entitlements with measurable thresholds",
+            "RESTRICTION": "Rule enforces restrictions with clear conditions and approval authorities",
+            "INFORMATIONAL": "Rule defines classifications or reference information"
+        }
+        enforce_reason = intent_map.get(intent, "Rule extracted from policy clause")
+        
+        rationale = f"""SOURCE: {orig_summary}
+
+ENFORCEABLE: {enforce_reason}. Entities extracted: {entity_str}. {ambig_summary}.
+
+KEY_VALUES: {entity_str}"""
+        
+        return rationale
+    
+    def generate_rationale_with_gemini(self, clause_id, original_clause, clarified_clause, entities, ambiguities_fixed):
+        """
+        Use Gemini to generate detailed rationale for why a rule was suggested.
+        OPTIMIZED: Shorter prompt, focused on key info only.
+        
+        Args:
+            clause_id: Clause identifier (C1, C2, etc.)
+            original_clause: Original clause text
+            clarified_clause: Clarified clause text
+            entities: Extracted entities from clause
+            ambiguities_fixed: List of ambiguities that were fixed
+            
+        Returns:
+            str: Rationale text
+        """
+        
+        # Truncate long texts to avoid timeout
+        orig_short = original_clause[:300] if original_clause else "N/A"
+        clarif_short = clarified_clause[:300] if clarified_clause else "N/A"
+        entities_str = json.dumps(entities, indent=2)[:200] if entities else "None"
+        
+        prompt = f"""Clause {clause_id}: Why is this rule enforceable?
+
+ORIGINAL: {orig_short}
+
+CLARIFIED: {clarif_short}
+
+ENTITIES: {entities_str}
+
+AMBIGUITIES FIXED: {", ".join(ambiguities_fixed) if ambiguities_fixed else "None"}
+
+TASK: Generate brief rationale (50-100 words):
+
+SOURCE: [1 sentence on policy requirement]
+ENFORCEABLE: [Why it's objectively checkable]
+KEY_VALUES: [Important thresholds/entities]
+
+Output ONLY the above format, no extra text."""
+        
+        try:
+            self.log_entry("GEMINI_REQUEST", f"Generating rationale for clause {clause_id}")
+            response = self.model.generate_content(prompt, request_options={"timeout": 30})
+            rationale = response.text.strip()
+            self.log_entry("GEMINI_RESPONSE", f"Rationale generated for {clause_id}")
+            return rationale
+        except Exception as e:
+            self.log_entry("ERROR", f"Gemini API failed for {clause_id}: {e}")
+            # Return fallback rationale
+            return f"SOURCE: {orig_short[:100]}\nENFORCEABLE: Rule extracted from policy clause\nKEY_VALUES: {', '.join(list(entities.keys())[:3]) if entities else 'N/A'}"
+    
+    def generate_confidence_and_rationale(self):
+        """
+        Main function to generate confidence scores and rationale for all clauses.
+        
+        Returns:
+            dict: Mapping of clause_id to {rationale, confidence}
+        """
+        
+        # Load stage 5 (clarified clauses)
+        stage5_data = self.read_json_file(self.stage5_file)
+        if not stage5_data:
+            self.log_entry("ERROR", "Cannot load stage5 data")
+            return None
+        
+        # Load stage 6 (DSL rules) to map which clauses have rules
+        stage6_data = self.read_yaml_file(self.stage6_file)
+        if not stage6_data:
+            self.log_entry("ERROR", "Cannot load stage6 data")
+            return None
+        
+        clarified_clauses = stage5_data.get("clarified_clauses", [])
+        rules = stage6_data.get("rules", [])
+        
+        # Build mapping of clause_id to rule data
+        rule_ids = {rule["rule_id"] for rule in rules}
+        
+        self.log_entry("INFO", f"Processing {len(clarified_clauses)} clauses")
+        self.log_entry("INFO", f"Found {len(rule_ids)} rules in stage 6")
+        
+        confidence_rationale = {}
+        
+        for clause in clarified_clauses:
+            clause_id = clause.get("clauseId")
+            
+            # Skip if no corresponding rule in stage 6
+            if clause_id not in rule_ids:
+                self.log_entry("WARNING", f"No rule found for {clause_id} in stage 6")
+                continue
+            
+            # Calculate confidence score
+            confidence = self.calculate_confidence_score(clause)
+            
+            # Generate rationale (LOCAL - no Gemini to avoid timeout)
+            original_text = clause.get("text_original", "")
+            clarified_text = clause.get("text_clarified", "")
+            entities = clause.get("entities", {})
+            ambiguities_fixed = clause.get("ambiguities_fixed", [])
+            intent = clause.get("intent", "UNKNOWN")
+            
+            # Build rationale locally
+            rationale = self.build_local_rationale(
+                clause_id,
+                original_text,
+                clarified_text,
+                entities,
+                ambiguities_fixed,
+                intent
+            )
+            
+            confidence_rationale[clause_id] = {
+                "clauseId": clause_id,
+                "rationale": rationale,
+                "confidence": round(confidence, 2),
+                "ambiguitiesFixed": ambiguities_fixed,
+                "sourceSection": intent
+            }
+            self.log_entry("SUCCESS", f"Generated confidence/rationale for {clause_id} (confidence: {round(confidence, 2)})")
+        
+        return confidence_rationale
+    
+    def save_confidence_rationale(self, data):
+        """Save confidence and rationale to JSON file"""
+        output = {
+            "metadata": {
+                "generated": datetime.now().isoformat(),
+                "stage": "7",
+                "source": [self.stage5_file, self.stage6_file],
+                "title": "Confidence & Rationale for DSL Rules",
+                "total_clauses": len(data)
+            },
+            "confidenceAndRationale": data
+        }
+        
+        try:
+            with open(self.rationale_file, 'w') as f:
+                json.dump(output, f, indent=2)
+            
+            self.log_entry("SUCCESS", f"Confidence & rationale saved to {self.rationale_file}")
+            return True
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save confidence & rationale: {e}")
+            return False
+    
+    def save_log(self):
+        """Append log to mechanism.log"""
+        with open(LOG_FILE, 'a') as f:
+            f.write("\n\n=== CONFIDENCE & RATIONALE GENERATION LOG ===\n")
             f.write(f"Timestamp: {datetime.now()}\n")
             f.write("="*50 + "\n\n")
             for entry in self.log:
@@ -1003,12 +2498,16 @@ def interactive_menu():
     print("POLICY ENFORCEMENT SYSTEM - INTERACTIVE MODE")
     print("="*80)
     print("\nSelect operation:")
-    print("  1) extract      - Extract policy from PDF → filename.txt")
-    print("  2) extract-rules - Extract rules from text → rules.txt")
-    print("  3) evaluate     - Evaluate payload against rules")
-    print("  4) exit         - Exit")
+    print("  1) extract          - Extract policy from PDF → filename.txt")
+    print("  2) extract-clauses  - Extract elaborated clauses → stage1_clauses.json")
+    print("  3) classify-intents - Classify clause intents → stage2_classified.json")
+    print("  4) extract-entities - Extract entities & thresholds → stage3_entities.json")
+    print("  5) extract-rules    - Extract ALL rules from text → rules.txt")
+    print("  6) evaluate         - Evaluate employee payload against rules")
+    print("  7) extract-topics   - Select topic → Generate rules for topic")
+    print("  8) exit             - Exit")
     
-    choice = input("\nEnter choice (1-4): ").strip()
+    choice = input("\nEnter choice (1-8): ").strip()
     
     if choice == "1":
         pdf_file = input("Enter PDF file path: ").strip()
@@ -1021,9 +2520,27 @@ def interactive_menu():
         text_file = input("Enter text file path (default: filename.txt): ").strip()
         if not text_file:
             text_file = f"{OUTPUT_DIR}/filename.txt"
-        return ("extract-rules", text_file)
+        return ("extract-clauses", text_file)
     
     elif choice == "3":
+        clauses_file = input("Enter clauses file path (default: stage1_clauses.json): ").strip()
+        if not clauses_file:
+            clauses_file = f"{OUTPUT_DIR}/stage1_clauses.json"
+        return ("classify-intents", clauses_file)
+    
+    elif choice == "4":
+        classified_file = input("Enter classified file path (default: stage2_classified.json): ").strip()
+        if not classified_file:
+            classified_file = f"{OUTPUT_DIR}/stage2_classified.json"
+        return ("extract-entities", classified_file)
+    
+    elif choice == "5":
+        text_file = input("Enter text file path (default: filename.txt): ").strip()
+        if not text_file:
+            text_file = f"{OUTPUT_DIR}/filename.txt"
+        return ("extract-rules", text_file)
+    
+    elif choice == "6":
         input_method = input("Enter payload via:\n  1) File path\n  2) Direct JSON input\n\nChoice (1-2): ").strip()
         
         if input_method == "1":
@@ -1070,7 +2587,13 @@ def interactive_menu():
             print("Invalid choice. Please try again.")
             return None
     
-    elif choice == "4":
+    elif choice == "7":
+        text_file = input("Enter text file path (default: filename.txt): ").strip()
+        if not text_file:
+            text_file = f"{OUTPUT_DIR}/filename.txt"
+        return ("extract-topics", text_file)
+    
+    elif choice == "8":
         print("Goodbye!")
         sys.exit(0)
     
@@ -1094,7 +2617,11 @@ def main():
         if len(sys.argv) < 3:
             print("Usage:")
             print("  python policy_validator.py extract <policy.pdf>")
+            print("  python policy_validator.py extract-clauses <filename.txt>")
+            print("  python policy_validator.py classify-intents <stage2_classified.json>")
+            print("  python policy_validator.py extract-entities <stage2_classified.json>")
             print("  python policy_validator.py extract-rules <filename.txt>")
+            print("  python policy_validator.py extract-topics <filename.txt>")
             print("  python policy_validator.py evaluate <payload.json>")
             print("\nOr run without arguments for interactive mode:")
             print("  python policy_validator.py")
@@ -1114,10 +2641,70 @@ def main():
         
         if success:
             print(f"\n✓ Extraction complete. Output: {OUTPUT_DIR}/filename.txt")
-            print("\nNext step: Extract rules with Gemini API")
-            print(f"  python policy_validator.py extract-rules {OUTPUT_DIR}/filename.txt")
+            print("\nNext step: Extract clauses with elaboration")
+            print(f"  python policy_validator.py extract-clauses {OUTPUT_DIR}/filename.txt")
         else:
             print("\n✗ Extraction failed. Check logs.")
+            sys.exit(1)
+    
+    elif command == "extract-clauses":
+        policy_file = arg
+        
+        print(f"\n{'='*80}")
+        print("STEP 1B: CLAUSE EXTRACTION & ELABORATION")
+        print(f"{'='*80}\n")
+        
+        clause_extractor = ClauseExtractor(policy_file)
+        success = clause_extractor.extract()
+        clause_extractor.save_log()
+        
+        if success:
+            print(f"\n✓ Clause extraction complete. Output: {OUTPUT_DIR}/stage1_clauses.json")
+            print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
+            print("\nNext step: Classify clause intents")
+            print(f"  python policy_validator.py classify-intents {OUTPUT_DIR}/stage1_clauses.json")
+        else:
+            print("\n✗ Clause extraction failed. Check logs.")
+            sys.exit(1)
+    
+    elif command == "classify-intents":
+        clauses_file = arg
+        
+        print(f"\n{'='*80}")
+        print("STEP 2: INTENT CLASSIFICATION")
+        print(f"{'='*80}\n")
+        
+        intent_classifier = IntentClassifier(clauses_file)
+        success = intent_classifier.classify()
+        intent_classifier.save_log()
+        
+        if success:
+            print(f"\n✓ Intent classification complete. Output: {OUTPUT_DIR}/stage2_classified.json")
+            print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
+            print("\nNext step: Extract entities and thresholds")
+            print(f"  python policy_validator.py extract-entities {OUTPUT_DIR}/stage2_classified.json")
+        else:
+            print("\n✗ Intent classification failed. Check logs.")
+            sys.exit(1)
+    
+    elif command == "extract-entities":
+        classified_file = arg
+        
+        print(f"\n{'='*80}")
+        print("STEP 3: ENTITY & THRESHOLD EXTRACTION")
+        print(f"{'='*80}\n")
+        
+        entity_extractor = EntityExtractor(classified_file)
+        success = entity_extractor.extract()
+        entity_extractor.save_log()
+        
+        if success:
+            print(f"\n✓ Entity extraction complete. Output: {OUTPUT_DIR}/stage3_entities.json")
+            print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
+            print("\nNext step: Extract rules from clauses")
+            print(f"  python policy_validator.py extract-rules {OUTPUT_DIR}/filename.txt")
+        else:
+            print("\n✗ Entity extraction failed. Check logs.")
             sys.exit(1)
     
     elif command == "extract-rules":
@@ -1136,6 +2723,73 @@ def main():
             print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
         else:
             print("\n✗ Rule extraction failed. Check logs.")
+            sys.exit(1)
+    
+    elif command == "extract-topics":
+        policy_file = arg
+        
+        print(f"\n{'='*80}")
+        print("STEP 2B: TOPIC/SCENARIO EXTRACTION & INDIVIDUAL RULE GENERATION")
+        print(f"{'='*80}\n")
+        
+        try:
+            rule_extractor = RuleExtractor(policy_file)
+            
+            # Step 1: Read policy file
+            print("Reading policy file...")
+            content = rule_extractor.read_policy_file()
+            if not content:
+                print("\n✗ Failed to read policy file.")
+                sys.exit(1)
+            
+            # Step 2: Extract topics
+            print("\nExtracting topics and scenarios from policy...")
+            topics_text = rule_extractor.extract_topics_and_scenarios(content)
+            if not topics_text:
+                print("\n✗ Failed to extract topics.")
+                sys.exit(1)
+            
+            # Display topics
+            print("\n" + "="*80)
+            print("AVAILABLE TOPICS/SCENARIOS IN POLICY:")
+            print("="*80)
+            print(topics_text)
+            print("="*80)
+            
+            # Step 3: Ask user which topic to generate rules for
+            print("\nEnter the topic name or number to generate individual rules for that topic.")
+            print("(or press Enter to skip and generate rules for all topics)")
+            topic_choice = input("\nTopic name/number: ").strip()
+            
+            if topic_choice:
+                # Step 4: Extract rules for specific topic
+                print(f"\nGenerating rules for: {topic_choice}")
+                topic_rules = rule_extractor.extract_rules_for_topic(content, topic_choice)
+                if not topic_rules:
+                    print(f"\n✗ Failed to extract rules for topic '{topic_choice}'")
+                    sys.exit(1)
+                
+                # Step 5: Format and save
+                formatted_rules = rule_extractor.format_topic_rules_output(topic_rules, topic_choice)
+                saved_file = rule_extractor.save_topic_rules(formatted_rules, topic_choice)
+                
+                if saved_file:
+                    print(f"\n✓ Topic rules generated successfully!")
+                    print(f"✓ Output file: {saved_file}")
+                else:
+                    print(f"\n✗ Failed to save topic rules.")
+                    sys.exit(1)
+            else:
+                print("\n⚠ No topic selected. Skipping individual rule generation.")
+                print("To generate rules for a specific topic, run: extract-topics again")
+            
+            rule_extractor.save_log()
+            
+        except FileNotFoundError as e:
+            print(f"ERROR: File not found: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: {e}")
             sys.exit(1)
     
     elif command == "evaluate":
@@ -1174,9 +2828,827 @@ def main():
             print(f"ERROR: {e}")
             sys.exit(1)
     
+    elif command == "detect-ambiguities":
+        stage3_file = arg
+        
+        print(f"\n{'='*80}")
+        print("STEP 4: AMBIGUITY DETECTION")
+        print(f"{'='*80}\n")
+        
+        detector = AmbiguityDetector(stage3_file)
+        success = detector.detect_ambiguities()
+        detector.save_log()
+        
+        if success:
+            print(f"\n✓ Ambiguity detection complete. Output: {OUTPUT_DIR}/stage4_ambiguity_flags.json")
+            print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
+            print("\nNext step: Clarify ambiguous clauses")
+            print(f"  python policy_validator.py clarify-ambiguities {OUTPUT_DIR}/stage3_entities.json")
+        else:
+            print("\n✗ Ambiguity detection failed. Check logs.")
+            sys.exit(1)
+    
+    elif command == "clarify-ambiguities":
+        stage3_file = arg
+        stage4_file = f"{OUTPUT_DIR}/stage4_ambiguity_flags.json"
+        
+        print(f"\n{'='*80}")
+        print("STEP 5: AMBIGUITY CLARIFICATION")
+        print(f"{'='*80}\n")
+        
+        clarifier = AmbiguityClarifier(stage3_file, stage4_file)
+        success = clarifier.clarify_all_clauses()
+        clarifier.save_log()
+        
+        if success:
+            print(f"\n✓ Ambiguity clarification complete. Output: {OUTPUT_DIR}/stage5_clarified_clauses.json")
+            print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
+            print("\nNext step: Generate DSL rules from clarified clauses")
+            print(f"  python policy_validator.py generate-dsl {OUTPUT_DIR}/stage5_clarified_clauses.json")
+        else:
+            print("\n✗ Ambiguity clarification failed. Check logs.")
+            sys.exit(1)
+    
+    elif command == "generate-dsl":
+        stage5_file = arg
+        stage4_file = f"{OUTPUT_DIR}/stage4_ambiguity_flags.json"
+        
+        print(f"\n{'='*80}")
+        print("STEP 6: DSL GENERATION")
+        print(f"{'='*80}\n")
+        
+        generator = DSLGenerator(stage5_file, stage4_file)
+        success = generator.generate_dsl_rules()
+        generator.save_log()
+        
+        if success:
+            print(f"\n✓ DSL generation complete. Output: {OUTPUT_DIR}/stage6_dsl_rules.yaml")
+            print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
+            print("\nGenerated DSL rules (YAML) ready for policy engine deployment")
+            print("\nNext step: Generate confidence scores and rationale for rules")
+            print(f"  python policy_validator.py confidence-rationale {OUTPUT_DIR}/stage5_clarified_clauses.json {OUTPUT_DIR}/stage6_dsl_rules.yaml")
+        else:
+            print("\n✗ DSL generation failed. Check logs.")
+            sys.exit(1)
+    
+    elif command == "confidence-rationale":
+        if len(sys.argv) < 4:
+            print("Usage:")
+            print("  python policy_validator.py confidence-rationale <stage5_clarified_clauses.json> <stage6_dsl_rules.yaml>")
+            sys.exit(1)
+
+        stage5_file = arg
+        stage6_file = sys.argv[3]
+
+        print(f"\n{'='*80}")
+        print("STEP 7: CONFIDENCE & RATIONALE GENERATION")
+        print(f"{'='*80}\n")
+
+        generator = ConfidenceAndRationaleGenerator(stage5_file, stage6_file)
+
+        # Generate confidence and rationale
+        confidence_data = generator.generate_confidence_and_rationale()
+
+        if confidence_data:
+            # Save to file
+            success = generator.save_confidence_rationale(confidence_data)
+            generator.save_log()
+
+            if success:
+                print(f"\n✓ Confidence & rationale generation complete.")
+                print(f"✓ Output: {OUTPUT_DIR}/stage7_confidence_rationale.json")
+                print(f"✓ Mechanism log: {OUTPUT_DIR}/mechanism.log")
+
+                # Print summary statistics
+                total = len(confidence_data)
+                avg_confidence = sum(v["confidence"] for v in confidence_data.values()) / total if total > 0 else 0
+                print(f"\nSummary:")
+                print(f"  Total clauses: {total}")
+                print(f"  Average confidence: {avg_confidence:.2f}")
+            else:
+                print("\n✗ Failed to save confidence & rationale. Check logs.")
+                sys.exit(1)
+        else:
+            print("\n✗ Confidence & rationale generation failed. Check logs.")
+            sys.exit(1)
+    
     else:
         print(f"ERROR: Unknown command '{command}'")
         sys.exit(1)
+
+
+class AmbiguityDetector:
+    """
+    Stage 4: Detect ambiguous clauses
+    
+    Flags clauses with:
+    - Subjective language (no objective boundaries)
+    - Undefined approval authorities
+    - Incomplete conditions (IF without THEN or vice versa)
+    - Vague metrics (e.g., "Actual" without upper limit)
+    
+    Output: Simple JSON array with {clauseId, ambiguous, reason}
+    
+    Uses data-driven ambiguity rules (not hardcoded in prompts)
+    """
+    
+    # Ambiguity rules - data driven, not hardcoded in prompts
+    AMBIGUITY_RULES = [
+        {
+            "code": "SUBJECTIVE_LANGUAGE",
+            "definition": "Uses vague or subjective terms without objective boundaries.",
+            "examples": ["reasonable", "appropriate", "suitable", "adequate", "emergency", "necessary", "sufficient"],
+            "severity": "HIGH"
+        },
+        {
+            "code": "UNDEFINED_AUTHORITY",
+            "definition": "Mentions an approving or deciding authority that is not clearly defined.",
+            "examples": ["approval", "approved by", "authorized by", "as decided by", "supervisor", "manager", "HOD"],
+            "severity": "HIGH"
+        },
+        {
+            "code": "INCOMPLETE_CONDITIONS",
+            "definition": "Contains conditional logic (IF/THEN) that does not specify all possible outcomes.",
+            "examples": ["IF X AND Y", "IF company provides X and Y"],
+            "severity": "MEDIUM"
+        },
+        {
+            "code": "BOUNDARY_OVERLAPS",
+            "definition": "Defines numeric ranges that overlap or share boundary values causing ambiguity.",
+            "examples": ["3-12 hours and 12-24 hours", "1-15 days and 15 days to 1 year"],
+            "severity": "MEDIUM"
+        },
+        {
+            "code": "UNDEFINED_REFERENCES",
+            "definition": "References terms, documents, or statuses that are not defined in the clause.",
+            "examples": ["tour advance", "employee status", "proof of stay", "actual bills"],
+            "severity": "MEDIUM"
+        },
+        {
+            "code": "VAGUE_METRICS",
+            "definition": "Uses numeric or monetary values without clear limits, units, or maximum caps.",
+            "examples": ["Actual (no limit)", "as per Table X", "applicable amount"],
+            "severity": "HIGH"
+        }
+    ]
+    
+    def __init__(self, stage3_file):
+        self.stage3_file = stage3_file
+        self.ambiguity_flags_file = f"{OUTPUT_DIR}/stage4_ambiguity_flags.json"
+        self.log = []
+        
+        # Initialize Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemma-3-27b-it')
+    
+    def build_ambiguity_prompt(self, clause_id, clause_text, entities_str):
+        """
+        Build Gemini prompt dynamically from AMBIGUITY_RULES config.
+        Keeps prompt generation logic separate from rule definitions.
+        
+        Returns: prompt string
+        """
+        # Build rules section from config
+        rules_text = ""
+        for i, rule in enumerate(self.AMBIGUITY_RULES, 1):
+            rules_text += f"{i}. {rule['code']}: {rule['definition']}\n"
+            rules_text += f"   Examples: {', '.join(rule['examples'][:3])}\n"
+            rules_text += f"   Severity: {rule['severity']}\n\n"
+        
+        prompt = f"""Analyze this policy clause for ambiguities using the following rule definitions.
+
+AMBIGUITY RULES:
+================
+
+{rules_text}
+
+CLAUSE TO ANALYZE:
+==================
+
+Clause ID: {clause_id}
+
+Text:
+{clause_text}
+
+Entities:
+{entities_str}
+
+TASK:
+=====
+1. Check clause against ALL 6 ambiguity rules above
+2. Be strict and practical - flag real ambiguities that would affect policy enforcement
+3. Focus on what is NOT clearly defined or what is subjective/vague
+4. Output ONLY valid JSON
+
+Output JSON:
+{{
+  "ambiguous": true/false,
+  "reason": "short explanation (cite the rule code if applicable)"
+}}
+"""
+        return prompt
+    
+    def log_entry(self, level, message):
+        """Log entry with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        self.log.append(entry)
+        print(entry)
+    
+    def load_stage3_data(self):
+        """Load stage3_entities.json"""
+        try:
+            with open(self.stage3_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to load stage3 data: {e}")
+            return None
+    
+    def detect_ambiguities_with_gemini(self, clause_id, clause_text, entities):
+        """
+        Use Gemini to dynamically detect ambiguities in a clause.
+        Uses prompt built from AMBIGUITY_RULES config (data-driven).
+        
+        Returns: (is_ambiguous, reason)
+        """
+        entities_str = json.dumps(entities, indent=2) if entities else "No entities"
+        
+        # Build prompt dynamically from config
+        prompt = self.build_ambiguity_prompt(clause_id, clause_text, entities_str)
+        
+        try:
+            response = self.model.generate_content(prompt)
+            response_text = response.text.strip()
+            
+            # Clean up response if wrapped in markdown
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            
+            response_text = response_text.strip()
+            
+            # Parse response
+            result = json.loads(response_text)
+            return result.get('ambiguous', False), result.get('reason', 'Unknown')
+            
+        except Exception as e:
+            self.log_entry("WARNING", f"Gemini analysis failed for {clause_id}: {e}")
+            return False, "Analysis skipped due to error"
+    
+    def analyze_clause(self, clause, extracted_entities):
+        """
+        Analyze single clause for ambiguity using Gemini LLM.
+        Returns: {clauseId, ambiguous, reason}
+        """
+        clause_id = clause['clauseId']
+        clause_text = clause['text']
+        entities = extracted_entities or {}
+        
+        # Use Gemini to detect ambiguities dynamically
+        is_ambiguous, reason = self.detect_ambiguities_with_gemini(clause_id, clause_text, entities)
+        
+        return {
+            "clauseId": clause_id,
+            "ambiguous": is_ambiguous,
+            "reason": reason
+        }
+    
+    def detect_ambiguities(self):
+        """Main detection pipeline"""
+        self.log_entry("INFO", "Starting Stage 4: Ambiguity Detection")
+        
+        # Load stage 3 data
+        data = self.load_stage3_data()
+        if not data:
+            return False
+        
+        extracted_clauses = data.get('extracted_clauses', [])
+        if not extracted_clauses:
+            self.log_entry("ERROR", "No extracted clauses found in stage3 data")
+            return False
+        
+        self.log_entry("INFO", f"Analyzing {len(extracted_clauses)} clauses for ambiguity")
+        
+        # Analyze each clause
+        ambiguity_flags = []
+        ambiguous_count = 0
+        
+        for clause in extracted_clauses:
+            clause_entities = clause.get('entities', {})
+            flag = self.analyze_clause(clause, clause_entities)
+            ambiguity_flags.append(flag)
+            
+            if flag['ambiguous']:
+                ambiguous_count += 1
+                self.log_entry("AMBIGUOUS", f"{flag['clauseId']}: {flag['reason']}")
+            else:
+                self.log_entry("CLEAR", f"{flag['clauseId']}: Clear, no ambiguity")
+        
+        self.log_entry("SUMMARY", f"Ambiguous clauses: {ambiguous_count}/{len(extracted_clauses)}")
+        
+        # Save results
+        self.save_ambiguity_flags(ambiguity_flags)
+        
+        return True
+    
+    def save_ambiguity_flags(self, ambiguity_flags):
+        """Save ambiguity flags to JSON"""
+        try:
+            with open(self.ambiguity_flags_file, 'w') as f:
+                json.dump(ambiguity_flags, f, indent=2)
+            
+            self.log_entry("SUCCESS", f"Ambiguity flags saved to: {self.ambiguity_flags_file}")
+            self.log_entry("OUTPUT", f"Total clauses analyzed: {len(ambiguity_flags)}")
+            
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save ambiguity flags: {e}")
+    
+    def save_log(self):
+        """Append log to mechanism.log"""
+        with open(LOG_FILE, 'a') as f:
+            f.write("\n\n=== STAGE 4: AMBIGUITY DETECTION LOG ===\n")
+            f.write(f"Timestamp: {datetime.now()}\n")
+            f.write("="*50 + "\n\n")
+            for entry in self.log:
+                f.write(entry + "\n")
+
+
+class AmbiguityClarifier:
+    """
+    Stage 5: Auto-fix ambiguities using LLM with parallel batch processing
+    
+    Takes ambiguity analysis from Stage 4 and uses it to clarify/fix clause text.
+    Preserves all numeric data while removing ambiguities.
+    
+    Features:
+    - Processes clauses in parallel (ThreadPoolExecutor)
+    - Batch processing with configurable chunk size
+    - Thread-safe logging
+    - Graceful error handling with fallback to original text
+    
+    Input:  stage3_entities.json + stage4_ambiguity_flags.json
+    Output: stage5_clarified_clauses.json
+    """
+    
+    def __init__(self, stage3_file, stage4_file, max_workers=4, batch_size=3):
+        self.stage3_file = stage3_file
+        self.stage4_file = stage4_file
+        self.clarified_file = f"{OUTPUT_DIR}/stage5_clarified_clauses.json"
+        self.log = []
+        self.log_lock = threading.Lock()  # Thread-safe logging
+        
+        # Parallel processing config
+        self.max_workers = max_workers  # Number of parallel threads
+        self.batch_size = batch_size    # Clauses per batch
+        
+        # Initialize Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemma-3-27b-it')
+    
+    def log_entry(self, level, message):
+        """Thread-safe log entry with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        with self.log_lock:
+            self.log.append(entry)
+        print(entry)
+    
+    def load_files(self):
+        """Load stage3 and stage4 data"""
+        try:
+            with open(self.stage3_file, 'r') as f:
+                stage3_data = json.load(f)
+            with open(self.stage4_file, 'r') as f:
+                stage4_data = json.load(f)
+            return stage3_data, stage4_data
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to load files: {e}")
+            return None, None
+    
+    def clarify_clause(self, clause_id, original_text, ambiguity_reason):
+        """
+        Use Gemini to clarify a clause based on its ambiguities.
+        Returns: clarified_text
+        """
+        prompt = f"""You are a policy clarification expert. Your task is to fix clause ambiguities.
+
+CLAUSE ID: {clause_id}
+
+ORIGINAL TEXT:
+{original_text}
+
+IDENTIFIED AMBIGUITIES:
+{ambiguity_reason}
+
+TASK:
+1. Rewrite the clause to FIX the identified ambiguities
+2. PRESERVE all original numeric data (amounts, dates, durations, percentages)
+3. ADD clarifications where ambiguities exist:
+   - Define vague terms (e.g., "Actual" → "Actual expenses capped at X amount")
+   - Clarify undefined references (e.g., "tour advance" → explain when/how issued)
+   - Fix boundary overlaps (e.g., "3-12 hours" and "12-24 hours" → "3 to <12 hours" and "≥12 to 24 hours")
+   - Define undefined authorities (e.g., "HOD approval" → "Approval from Head of Department")
+   - Complete incomplete conditions (e.g., "IF X AND Y provided" → "IF company provides BOTH X AND Y, THEN...")
+4. Keep the tone, structure, and references to other clauses intact (C1, C2, refs:, etc.)
+5. Output ONLY the clarified clause text - no explanations, no markdown
+
+CLARIFIED TEXT:"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            clarified_text = response.text.strip()
+            
+            # Clean up if wrapped in markdown
+            if clarified_text.startswith("```"):
+                clarified_text = clarified_text.split("```")[1]
+                if clarified_text.startswith("text"):
+                    clarified_text = clarified_text[4:]
+                clarified_text = clarified_text.strip()
+            
+            return clarified_text
+            
+        except Exception as e:
+            self.log_entry("WARNING", f"Clarification failed for {clause_id}: {e}")
+            return original_text  # Return original if clarification fails
+    
+    def process_single_clause(self, clause, ambiguity_map):
+        """Process a single clause (for parallel execution)"""
+        clause_id = clause['clauseId']
+        original_text = clause['text']
+        entities = clause.get('entities', {})
+        ambiguity_reason = ambiguity_map.get(clause_id, '')
+        
+        # Extract which ambiguity codes exist in the reason
+        ambiguities_fixed = []
+        for code in ['SUBJECTIVE_LANGUAGE', 'UNDEFINED_AUTHORITY', 'INCOMPLETE_CONDITIONS', 
+                    'BOUNDARY_OVERLAPS', 'UNDEFINED_REFERENCES', 'VAGUE_METRICS']:
+            if code in ambiguity_reason:
+                ambiguities_fixed.append(f"Fixed: {code}")
+        
+        # Skip clarification if no ambiguity found
+        if not ambiguity_reason or ambiguity_reason == "No ambiguity detected":
+            clarified_text = original_text
+            ambiguities_fixed = []
+            self.log_entry("SKIP", f"{clause_id}: No ambiguities to fix")
+        else:
+            # Clarify the clause
+            self.log_entry("PROCESSING", f"{clause_id}: Generating clarified text...")
+            clarified_text = self.clarify_clause(clause_id, original_text, ambiguity_reason)
+            self.log_entry("CLARIFIED", f"{clause_id}: Text clarified ({len(ambiguities_fixed)} issues addressed)")
+        
+        return {
+            "clauseId": clause_id,
+            "text_original": original_text,
+            "text_clarified": clarified_text,
+            "ambiguity_reason": ambiguity_reason,
+            "ambiguities_fixed": ambiguities_fixed if ambiguity_reason != "No ambiguity detected" else [],
+            "entities": entities,
+            "intent": clause.get('intent', '')
+        }
+    
+    def clarify_all_clauses(self):
+        """Main clarification pipeline with parallel batch processing"""
+        self.log_entry("INFO", "Starting Stage 5: Ambiguity Clarification (Parallel)")
+        self.log_entry("INFO", f"Configuration: max_workers={self.max_workers}, batch_size={self.batch_size}")
+        
+        # Load both stage3 and stage4 data
+        stage3_data, stage4_data = self.load_files()
+        if not stage3_data or not stage4_data:
+            return False
+        
+        stage3_clauses = stage3_data.get('extracted_clauses', [])
+        ambiguity_flags = stage4_data if isinstance(stage4_data, list) else []
+        
+        # Create mapping: clauseId -> ambiguity_reason
+        ambiguity_map = {flag['clauseId']: flag.get('reason', '') for flag in ambiguity_flags}
+        
+        self.log_entry("INFO", f"Processing {len(stage3_clauses)} clauses in batches of {self.batch_size}")
+        
+        clarified_clauses = []
+        
+        # Process clauses in parallel using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            futures = {
+                executor.submit(self.process_single_clause, clause, ambiguity_map): clause['clauseId']
+                for clause in stage3_clauses
+            }
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                clause_id = futures[future]
+                try:
+                    result = future.result()
+                    clarified_clauses.append(result)
+                    completed += 1
+                    self.log_entry("COMPLETE", f"Progress: {completed}/{len(stage3_clauses)} clauses")
+                except Exception as e:
+                    self.log_entry("ERROR", f"{clause_id}: Processing failed: {e}")
+        
+        # Sort by clause ID for consistent output
+        clarified_clauses.sort(key=lambda x: x['clauseId'])
+        
+        # Save clarified clauses
+        self.save_clarified_clauses(clarified_clauses)
+        
+        return True
+    
+    def save_clarified_clauses(self, clarified_clauses):
+        """Save clarified clauses to JSON"""
+        output = {
+            "metadata": {
+                "generated": datetime.now().isoformat(),
+                "source": "stage3_entities.json + stage4_ambiguity_flags.json",
+                "format": "Clarified Clauses (Stage 5)",
+                "total_clauses": len(clarified_clauses),
+                "stage": "5"
+            },
+            "clarified_clauses": clarified_clauses
+        }
+        
+        try:
+            with open(self.clarified_file, 'w') as f:
+                json.dump(output, f, indent=2)
+            
+            self.log_entry("SUCCESS", f"Clarified clauses saved to: {self.clarified_file}")
+            
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save clarified clauses: {e}")
+    
+    def save_log(self):
+        """Append log to mechanism.log"""
+        with open(LOG_FILE, 'a') as f:
+            f.write("\n\n=== STAGE 5: AMBIGUITY CLARIFICATION LOG ===\n")
+            f.write(f"Timestamp: {datetime.now()}\n")
+            f.write("="*50 + "\n\n")
+            for entry in self.log:
+                f.write(entry + "\n")
+
+
+class DSLGenerator:
+    """
+    Stage 6: Generate DSL rules from clarified clauses
+    
+    Converts Stage 5 clarified clause data into executable DSL format.
+    Uses extracted entities to build when/then rule conditions.
+    Marks ambiguous rules with WARN actions instead of ENFORCE.
+    
+    Input:  stage5_clarified_clauses.json + stage4_ambiguity_flags.json
+    Output: stage6_dsl_rules.yaml
+    """
+    
+    def __init__(self, stage5_file, stage4_file):
+        self.stage5_file = stage5_file
+        self.stage4_file = stage4_file
+        self.dsl_file = f"{OUTPUT_DIR}/stage6_dsl_rules.yaml"
+        self.log = []
+        self.log_lock = threading.Lock()
+    
+    def log_entry(self, level, message):
+        """Thread-safe log entry"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        with self.log_lock:
+            self.log.append(entry)
+        print(entry)
+    
+    def load_files(self):
+        """Load stage5 and stage4 data"""
+        try:
+            with open(self.stage5_file, 'r') as f:
+                stage5_data = json.load(f)
+            with open(self.stage4_file, 'r') as f:
+                stage4_data = json.load(f)
+            return stage5_data, stage4_data
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to load files: {e}")
+            return None, None
+    
+    def build_when_condition(self, clause_id, intent, entities):
+        """Build 'when' condition from entities - minimal format"""
+        conditions = []
+        
+        if not entities:
+            return None
+        
+        # Travel Classification rules (C2)
+        if 'tourDurationUpperLimit' in entities:
+            conditions.append({
+                'fact': 'travel.duration',
+                'operator': 'LESS_THAN_OR_EQUAL',
+                'value': entities['tourDurationUpperLimit']
+            })
+        
+        if 'deputationDurationLowerLimit' in entities and 'deputationDurationUpperLimit' in entities:
+            conditions.append({
+                'fact': 'travel.duration',
+                'operator': 'GREATER_THAN_OR_EQUAL',
+                'value': entities['deputationDurationLowerLimit']
+            })
+            conditions.append({
+                'fact': 'travel.duration',
+                'operator': 'LESS_THAN_OR_EQUAL',
+                'value': entities['deputationDurationUpperLimit']
+            })
+        
+        # Allowance rules
+        if 'allowanceDependency' in entities:
+            conditions.append({
+                'fact': 'employee.grade',
+                'operator': 'EXISTS',
+                'value': 'ANY'
+            })
+        
+        if 'lodgingBoardingAllowanceVariation' in entities:
+            conditions.append({
+                'fact': 'location.category',
+                'operator': 'IN',
+                'value': 'CATEGORY_A | CATEGORY_B'
+            })
+        
+        # Mileage rate rules
+        if 'fourWheelerMileageRate' in entities or 'twoWheelerMileageRate' in entities:
+            conditions.append({
+                'fact': 'vehicle.type',
+                'operator': 'IN',
+                'value': 'FOUR_WHEELER | TWO_WHEELER'
+            })
+        
+        # Part-day entitlement rules
+        if 'minimumTourDurationHours' in entities:
+            conditions.append({
+                'fact': 'tour.duration_hours',
+                'operator': 'GREATER_THAN_OR_EQUAL',
+                'value': entities['minimumTourDurationHours']
+            })
+        
+        # Booking rules
+        if 'bookingRequestLeadTime' in entities:
+            conditions.append({
+                'fact': 'booking.submitTime',
+                'operator': 'BEFORE',
+                'value': entities['bookingRequestLeadTime']
+            })
+        
+        if 'bookingRestriction' in entities:
+            conditions.append({
+                'fact': 'booking.type',
+                'operator': 'NOT_EQUALS',
+                'value': 'DIRECT'
+            })
+        
+        # Bill submission rules
+        if 'billSubmissionDeadlineAfterTourCompletion' in entities:
+            conditions.append({
+                'fact': 'bill.submitTime',
+                'operator': 'WITHIN_DAYS',
+                'value': entities['billSubmissionDeadlineAfterTourCompletion']
+            })
+        
+        return conditions if conditions else None
+    
+    def build_then_constraint(self, clause_id, intent, entities):
+        """Build 'then' constraints - minimal format"""
+        constraints = []
+        
+        # Travel Classification rules
+        if 'travelClassifications' in entities:
+            if 'tourDurationUpperLimit' in entities:
+                constraints.append({
+                    'constraint': 'travel.type',
+                    'operator': 'EQUALS',
+                    'value': 'TOUR'
+                })
+            elif 'deputationDurationLowerLimit' in entities:
+                constraints.append({
+                    'constraint': 'travel.type',
+                    'operator': 'EQUALS',
+                    'value': 'DEPUTATION'
+                })
+            elif 'transferDurationLowerLimit' in entities:
+                constraints.append({
+                    'constraint': 'travel.type',
+                    'operator': 'EQUALS',
+                    'value': 'TRANSFER'
+                })
+        
+        # Allowance constraints
+        if intent == 'CONDITIONAL_ALLOWANCE':
+            if 'lodgingReimbursementRate' in entities:
+                constraints.append({
+                    'constraint': 'allowance.lodging',
+                    'operator': 'EQUALS',
+                    'value': entities['lodgingReimbursementRate']
+                })
+            if 'fourWheelerMileageRate' in entities:
+                constraints.append({
+                    'constraint': 'mileage.fourWheeler',
+                    'operator': 'EQUALS',
+                    'value': entities['fourWheelerMileageRate']
+                })
+            if 'twoWheelerMileageRate' in entities:
+                constraints.append({
+                    'constraint': 'mileage.twoWheeler',
+                    'operator': 'EQUALS',
+                    'value': entities['twoWheelerMileageRate']
+                })
+        
+        # Restriction constraints
+        if intent == 'RESTRICTION':
+            if 'requiredApproval' in entities:
+                constraints.append({
+                    'constraint': 'approval.required',
+                    'operator': 'EQUALS',
+                    'value': entities['requiredApproval']
+                })
+            if 'billSubmissionDeadlineAfterTourCompletion' in entities:
+                constraints.append({
+                    'constraint': 'bill.deadline',
+                    'operator': 'EQUALS',
+                    'value': entities['billSubmissionDeadlineAfterTourCompletion']
+                })
+        
+        return constraints if constraints else [{'constraint': 'PASS', 'operator': 'EQUALS', 'value': 'OK'}]
+    
+    def generate_dsl_rules(self):
+        """Generate DSL rules from clarified clauses (minimal format)"""
+        self.log_entry("INFO", "Starting Stage 6: DSL Generation (Minimal Format)")
+        
+        # Load data
+        stage5_data, stage4_data = self.load_files()
+        if not stage5_data or not stage4_data:
+            return False
+        
+        clarified_clauses = stage5_data.get('clarified_clauses', [])
+        ambiguity_map = {flag['clauseId']: flag.get('ambiguous', False) 
+                        for flag in stage4_data if isinstance(stage4_data, list)}
+        
+        self.log_entry("INFO", f"Generating DSL for {len(clarified_clauses)} clauses")
+        
+        dsl_rules = []
+        
+        for clause in clarified_clauses:
+            clause_id = clause['clauseId']
+            intent = clause.get('intent', 'INFORMATIONAL')
+            entities = clause.get('entities', {})
+            is_ambiguous = ambiguity_map.get(clause_id, False)
+            
+            self.log_entry("PROCESSING", f"{clause_id}: Generating DSL ({intent})")
+            
+            # Build when condition
+            when_conditions = self.build_when_condition(clause_id, intent, entities)
+            
+            # Build then constraints
+            then_constraints = self.build_then_constraint(clause_id, intent, entities)
+            
+            # Create minimal rule
+            rule = {
+                'rule_id': clause_id,
+                'when': {
+                    'all': when_conditions if when_conditions else []
+                },
+                'then': {
+                    'enforce' if not is_ambiguous else 'warn': then_constraints
+                }
+            }
+            
+            dsl_rules.append(rule)
+            self.log_entry("GENERATED", f"{clause_id}: DSL rule created")
+        
+        # Save DSL rules
+        self.save_dsl_rules(dsl_rules)
+        
+        return True
+    
+    def save_dsl_rules(self, dsl_rules):
+        """Save DSL rules as YAML"""
+        import yaml
+        
+        output = {
+            'rules': dsl_rules
+        }
+        
+        try:
+            with open(self.dsl_file, 'w') as f:
+                yaml.dump(output, f, default_flow_style=False, sort_keys=False, width=200)
+            
+            self.log_entry("SUCCESS", f"DSL rules saved to: {self.dsl_file}")
+            
+        except Exception as e:
+            self.log_entry("ERROR", f"Failed to save DSL rules: {e}")
+    
+    def save_log(self):
+        """Append log to mechanism.log"""
+        with open(LOG_FILE, 'a') as f:
+            f.write("\n\n=== STAGE 6: DSL GENERATION LOG ===\n")
+            f.write(f"Timestamp: {datetime.now()}\n")
+            f.write("="*50 + "\n\n")
+            for entry in self.log:
+                f.write(entry + "\n")
 
 
 if __name__ == "__main__":
