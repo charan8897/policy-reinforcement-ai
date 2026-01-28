@@ -74,7 +74,7 @@ class PipelineConfig:
     TEXT_PREVIEW_LENGTH = 8000  # For pattern discovery
     
     # Parallel Processing
-    DEFAULT_MAX_WORKERS = 7
+    DEFAULT_MAX_WORKERS = 8
     DEFAULT_BATCH_SIZE = 3
     ENTITY_EXTRACTION_WORKERS = 6
     AMBIGUITY_CLARIFICATION_WORKERS = 4
@@ -1303,7 +1303,7 @@ Output ONLY valid JSON. No explanation outside the JSON object.
             return classified_clause
         
         # Process clauses in parallel (5 workers for optimal speed)
-        with ThreadPoolExecutor(max_workers=7) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             clause_data = [(i, clause) for i, clause in enumerate(clauses, 1)]
             classified = list(executor.map(classify_single_clause, clause_data))
         
@@ -1389,7 +1389,7 @@ class EntityExtractor:
     Entity types: Type, Class, Category, amount, Currency, Hours, location, role, ApprovalAuthority
     """
     
-    def __init__(self, classified_file, document_id=None, enable_mongodb=True, use_langchain=True, max_workers=7):
+    def __init__(self, classified_file, document_id=None, enable_mongodb=True, use_langchain=True, max_workers=8):
         self.classified_file = classified_file
         self.entities_file = f"{OUTPUT_DIR}/stage3_entities.json"
         self.document_id = document_id
@@ -2727,7 +2727,7 @@ Output ONLY the above format, no extra text."""
 class PayloadEvaluator:
     """Step 3: Iterative payload evaluation against rules using LLM feedback loop (GENERIC - ANY POLICY)"""
     
-    def __init__(self, rules_file, max_attempts=5):
+    def __init__(self, rules_file, max_attempts=4):
         self.rules_file = rules_file
         self.max_attempts = max_attempts
         self.log = []
@@ -4277,7 +4277,7 @@ OUTPUT ONLY valid JSON matching the schema."""
             
             return flag
         
-        with ThreadPoolExecutor(max_workers=7) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             ambiguity_flags = list(executor.map(analyze_single, extracted_clauses))
         
         ambiguous_count = sum(1 for flag in ambiguity_flags if flag['ambiguous'])
@@ -4339,7 +4339,7 @@ class AmbiguityClarifier:
     Output: stage5_clarified_clauses.json
     """
     
-    def __init__(self, stage3_file, stage4_file, document_id=None, enable_mongodb=True, max_workers=7, batch_size=3):
+    def __init__(self, stage3_file, stage4_file, document_id=None, enable_mongodb=True, max_workers=4, batch_size=3):
         self.stage3_file = stage3_file
         self.stage4_file = stage4_file
         self.clarified_file = f"{OUTPUT_DIR}/stage5_clarified_clauses.json"
@@ -5399,7 +5399,7 @@ class PipelineOrchestrator:
             stage5_file = self.stage_results.get('stage5_file', f"{OUTPUT_DIR}/stage5_clarified_clauses.json")
             stage4_file = self.stage_results.get('stage4_file', f"{OUTPUT_DIR}/stage4_ambiguity_flags.json")
             generator = DSLGenerator(stage5_file, stage4_file, enable_mongodb=self.enable_mongodb)
-            success = generator.generate()
+            success = generator.generate_dsl_rules()
             generator.save_log()
             
             if success:
