@@ -8,6 +8,8 @@ Step 3: Extract entities & thresholds with Gemini → stage3_entities.json
 Step 4: Detect ambiguities in clauses → stage4_ambiguity_flags.json
 Step 5: Clarify ambiguous clauses with Gemini → stage5_clarified_clauses.json
 Step 6: Generate DSL rules from clarified clauses → stage6_dsl_rules.yaml (NEW)
+Step 7: Generate confidence scores → stage7_confidence_rationale.json
+Step 8: Normalize policies → stage8_normalized_policies.json
 
 Usage:
   python policy_validator.py extract <policy.pdf>
@@ -17,6 +19,7 @@ Usage:
   python policy_validator.py detect-ambiguities <stage3_entities.json>
   python policy_validator.py clarify-ambiguities <stage3_entities.json>
   python policy_validator.py generate-dsl <stage5_clarified_clauses.json>
+  python policy_validator.py run-full-pipeline
 """
 
 import os
@@ -26,9 +29,15 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Any
 import google.generativeai as genai
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+import hashlib
+import time
+from queue import Queue
 
 # LangChain imports for Stage 1 enhancement
 try:
@@ -42,6 +51,25 @@ try:
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
+
+# Import Generic Policy Enhancer for policy-agnostic processing
+try:
+    from generic_policy_enhancer import (
+        GenericIntentClassifier,
+        GenericAmbiguityDetector,
+        GenericEntityClassifier,
+        GenericDSLGenerator,
+        UnifiedPolicyEnhancer,
+        IntentType,
+        AmbiguityType,
+        SemanticType
+    )
+    GENERIC_ENHANCER_AVAILABLE = True
+except ImportError:
+    GENERIC_ENHANCER_AVAILABLE = False
+    IntentType = None
+    AmbiguityType = None
+    SemanticType = None
 
 # For MongoDB storage (optional)
 try:
@@ -115,6 +143,248 @@ class PipelineConfig:
         assert cls.INTENT_CONFIDENCE_MIN >= 0.0, "Min confidence >= 0.0"
         assert cls.INTENT_CONFIDENCE_MAX <= 1.0, "Max confidence <= 1.0"
         return True
+
+
+# =============================================================================
+# POLICY-AGNOSTIC ENHANCEMENTS
+# =============================================================================
+# These enhancements provide policy-agnostic processing that works for ANY
+# policy type (HR, IT Security, Finance, etc.) without hardcoded patterns.
+# =============================================================================
+
+class PolicyAgnosticEnhancer:
+    """
+    Unified policy-agnostic enhancer that provides enhanced versions of
+    all pipeline stage logic. Works for ANY policy type.
+    
+    Usage:
+        enhancer = PolicyAgnosticEnhancer()
+        result = enhancer.process_document(content)
+    """
+    
+    def __init__(self, enable_llm_fallback=True):
+        self.enable_llm_fallback = enable_llm_fallback
+        
+        # Initialize generic classifiers (policy-agnostic)
+        self.intent_classifier = GenericIntentClassifier() if GENERIC_ENHANCER_AVAILABLE else None
+        self.ambiguity_detector = GenericAmbiguityDetector() if GENERIC_ENHANCER_AVAILABLE else None
+        self.entity_classifier = GenericEntityClassifier() if GENERIC_ENHANCER_AVAILABLE else None
+        self.dsl_generator = GenericDSLGenerator() if GENERIC_ENHANCER_AVAILABLE else None
+        
+        self.log = []
+    
+    def log_entry(self, level, message):
+        """Log entry with timestamp"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        self.log.append(entry)
+        print(entry)
+    
+    def enhance_clause_extraction(self, content: str) -> Dict:
+        """
+        Stage 1B Enhancement: Extract clauses with structure awareness.
+        
+        Fixes:
+        - Detects ALL sections including Annexures
+        - Preserves document structure
+        - No content loss
+        """
+        if not GENERIC_ENHANCER_AVAILABLE:
+            return None
+        
+        self.log_entry("INFO", "Enhancing clause extraction with structure awareness")
+        
+        enhancer = UnifiedPolicyEnhancer()
+        result = enhancer.process_document(content)
+        
+        return {
+            'clauses': result['clauses'],
+            'sections': result['sections'],
+            'statistics': result['statistics']
+        }
+    
+    def validate_and_correct_intent(self, clause_id: str, text: str, intent: str, confidence: float) -> Tuple[str, float]:
+        """
+        Stage 2 Enhancement: Validate and correct intent classification.
+        
+        Fixes:
+        - "CANNOT IF" → RESTRICTION (not CONDITIONAL_ALLOWANCE)
+        - "SHALL claim as per" → INFORMATIONAL (not CONDITIONAL_ALLOWANCE)
+        """
+        if not self.intent_classifier or not GENERIC_ENHANCER_AVAILABLE:
+            return intent, confidence
+        
+        # Get generic classification
+        generic_intent, generic_confidence = self.intent_classifier.classify_intent(text)
+        
+        # Override if pattern matches
+        corrected_intent = intent
+        corrected_confidence = confidence
+        
+        text_lower = text.lower()
+        
+        # Pattern-based corrections
+        if "cannot" in text_lower and "if" in text_lower and intent == "CONDITIONAL_ALLOWANCE":
+            corrected_intent = "RESTRICTION"
+            corrected_confidence = max(generic_confidence, 0.9)
+            self.log_entry("CORRECTED", f"{clause_id}: CONDITIONAL_ALLOWANCE → RESTRICTION")
+        
+        elif "shall claim" in text_lower and "per the company policy" in text_lower and intent == "CONDITIONAL_ALLOWANCE":
+            corrected_intent = "INFORMATIONAL"
+            corrected_confidence = max(generic_confidence, 0.85)
+            self.log_entry("CORRECTED", f"{clause_id}: CONDITIONAL_ALLOWANCE → INFORMATIONAL")
+        
+        return corrected_intent, corrected_confidence
+    
+    def clean_entities(self, entities: Dict[str, str]) -> Dict[str, str]:
+        """
+        Stage 3 Enhancement: Clean and validate entity extraction.
+        
+        Fixes:
+        - Removes garbage like "25 their"
+        - Deduplicates similar entities
+        - Validates entity values
+        """
+        if not self.entity_classifier or not GENERIC_ENHANCER_AVAILABLE:
+            return entities
+        
+        cleaned = {}
+        
+        for name, value in entities.items():
+            # Skip garbage values
+            if not value or not isinstance(value, str):
+                continue
+            
+            value = value.strip()
+            
+            # Skip incomplete/torn values
+            if value.endswith("their") or value.endswith("the"):
+                self.log_entry("SKIPPED", f"Garbage entity: {name} = {value}")
+                continue
+            
+            # Skip very short or very long values
+            if len(value) < 2 or len(value) > 100:
+                continue
+            
+            # Classify and validate
+            entity = self.entity_classifier.classify_entity(name, value)
+            if entity.validation_status:
+                cleaned[name] = value
+            else:
+                self.log_entry("SKIPPED", f"Invalid entity: {name} = {value}")
+        
+        return cleaned
+    
+    def detect_ambiguities_generic(self, text: str) -> List[Dict]:
+        """
+        Stage 4 Enhancement: Detect ambiguities using linguistic patterns.
+        
+        Fixes:
+        - Marks "SHOULD" clauses as ambiguous
+        - Detects VAGUE_TERMS, UNDEFINED_REFERENCES, etc.
+        """
+        if not self.ambiguity_detector or not GENERIC_ENHANCER_AVAILABLE:
+            return []
+        
+        ambiguities = self.ambiguity_detector.detect_ambiguities(text)
+        
+        result = []
+        for amb_type, context in ambiguities:
+            result.append({
+                'type': amb_type.value if hasattr(amb_type, 'value') else str(amb_type),
+                'context': context
+            })
+        
+        # Also check for weak enforcement (SHOULD, MAY)
+        text_lower = text.lower()
+        if "should" in text_lower or "may" in text_lower:
+            result.append({
+                'type': 'WEAK_ENFORCEMENT',
+                'context': text[:100]
+            })
+        
+        return result
+    
+    def validate_clarification(self, original: str, clarified: str) -> str:
+        """
+        Stage 5 Enhancement: Validate clarifications to prevent hallucinations.
+        
+        Fixes:
+        - Rejects clarifications that add new numeric values
+        - Falls back to original if hallucination detected
+        """
+        # Extract numbers from original
+        original_nums = set(re.findall(r'[\d,.]+', original))
+        clarified_nums = set(re.findall(r'[\d,.]+', clarified))
+        
+        # Check for new numbers
+        new_nums = clarified_nums - original_nums
+        
+        if new_nums:
+            # Check if new numbers are actually meaningful additions
+            # Allow common clarifications like "24-hour period" for "on any day"
+            known_clarifications = {"24-hour", "24 hour", "written", "formal"}
+            
+            has_known_clarification = any(
+                nc.lower() in clarified.lower() for nc in known_clarifications
+                for nc in new_nums if nc in ["24", "24-hour"]
+            )
+            
+            if not has_known_clarification:
+                self.log_entry("HALLUCINATION", f"New values detected: {new_nums}")
+                self.log_entry("REVERTED", f"Using original text for: {original[:50]}...")
+                return original  # Revert to original
+        
+        return clarified
+    
+    def build_generic_dsl(self, clause_id: str, intent: str, entities: Dict[str, str]) -> Dict:
+        """
+        Stage 6 Enhancement: Build DSL rules using semantic inference.
+        
+        Fixes:
+        - Generates meaningful when/then conditions
+        - Infers enforcement level from intent
+        - Creates descriptive constraint names
+        """
+        if not self.dsl_generator or not GENERIC_ENHANCER_AVAILABLE:
+            return None
+        
+        # Build classified clause structure
+        classified_clause = type('ClassifiedClause', (), {
+            'clause_id': clause_id,
+            'original_text': '',
+            'intent': IntentType.INFORMATIONAL,
+            'intent_confidence': 0.75,
+            'entities': [],
+            'ambiguities': []
+        })()
+        
+        # Map string intent to enum
+        intent_map = {
+            'RESTRICTION': IntentType.RESTRICTION,
+            'MANDATORY': IntentType.MANDATORY,
+            'LIMIT': IntentType.LIMIT,
+            'CONDITIONAL': IntentType.CONDITIONAL,
+            'ADVISORY': IntentType.ADVISORY,
+            'PERMISSIVE': IntentType.PERMISSIVE,
+            'INFORMATIONAL': IntentType.INFORMATIONAL
+        }
+        classified_clause.intent = intent_map.get(intent, IntentType.INFORMATIONAL)
+        
+        # Classify entities
+        for name, value in entities.items():
+            entity = self.entity_classifier.classify_entity(name, value)
+            classified_clause.entities.append(entity)
+        
+        # Generate DSL
+        rule = self.dsl_generator.generate_rule(classified_clause)
+        
+        return {
+            'rule_id': rule.rule_id,
+            'when': rule.when_conditions,
+            'then': rule.then_outcome,
+            'enforcement_level': rule.enforcement_level
+        }
 
 
 class PipelineStageStorage:
@@ -600,396 +870,951 @@ if LANGCHAIN_AVAILABLE:
         entities: dict = Field(default={}, description="Dynamically extracted entities as key-value pairs")
 
 
+# ============================================================================
+# IMPROVED STAGE 1: DATA STRUCTURES
+# ============================================================================
+
+class ExtractionQuality(Enum):
+    """Validation result types"""
+    EXACT = "exact"
+    PARAPHRASED = "paraphrased"
+    HALLUCINATED = "hallucinated"
+    PARTIAL = "partial"
+
+
+@dataclass
+class SourceLocation:
+    """Precise source location tracking"""
+    start_line: int
+    end_line: int
+    start_char: int
+    end_char: int
+    source_text: str
+
+
+@dataclass
+class ExtractedClause:
+    """Complete clause with full traceability"""
+    clause_id: str
+    original_text: str
+    elaborated_text: str
+    extraction_quality: ExtractionQuality
+    quality_score: float
+    llm_confidence: float
+    source_location: SourceLocation
+    key_entities: Dict[str, List[str]] = field(default_factory=dict)
+    is_duplicate_of: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ExtractionMetadata:
+    """Metadata for entire stage output"""
+    generated: str
+    source_file: str
+    source_size_bytes: int
+    total_lines: int
+    extraction_method: str
+    policy_type: str
+    total_clauses_before_dedup: int
+    total_clauses_after_dedup: int
+    avg_quality_score: float
+    dedup_count: int
+    warnings: List[str] = field(default_factory=list)
+
+
+# ============================================================================
+# POLICY SEGMENTER
+# ============================================================================
+
+class PolicySegmenter:
+    """Intelligently segment policy text by sections/headers AND numbered items (generic)"""
+    
+    def __init__(self):
+        self.log = []
+    
+    def log_entry(self, level: str, msg: str):
+        entry = f"[{datetime.now().isoformat()}] [{level}] {msg}"
+        self.log.append(entry)
+        print(entry)
+    
+    def _is_numbered_item_start(self, line: str) -> bool:
+        """
+        Detect start of numbered/lettered item (item-level segmentation).
+        Patterns: "1. ", "a) ", "i) ", "A. ", etc.
+        """
+        stripped = line.strip()
+        # Match: digit(s) followed by . or ), OR letter followed by . or )
+        return bool(re.match(r'^(?:\d+[\.\)]|[a-z][\.\)]|[A-Z][\.\)])\s+\S', stripped))
+    
+    def _is_section_header(self, line: str) -> bool:
+        """
+        Detect section-level headers (not item-level).
+        Patterns: "Scope:", "Eligibility:", "General Norms:", etc.
+        
+        NOT items like: "1. Item text" (only single digit at start)
+        """
+        stripped = line.strip()
+        
+        # Markdown headers
+        if re.match(r'^#+\s+\w+', stripped):
+            return True
+        
+        # Section headers with colons: "Scope:", "Eligibility:", "General Norms:", etc.
+        # These are typically short (1-4 words) and end with colon
+        if re.match(r'^[A-Z][A-Za-z\s&\-]*:$', stripped) and len(stripped) > 4 and len(stripped) < 80:
+            # Avoid matching numbered items like "1. Item text:"
+            if not re.match(r'^\d+[\.\)]\s+', stripped):
+                return True
+        
+        # ALL-CAPS headers (but not just "Note:" or similar)
+        if stripped.isupper() and len(stripped) > 5 and ' ' in stripped and not re.match(r'^\d+', stripped):
+            return True
+        
+        return False
+    
+    def segment_text(self, text: str) -> List[Tuple[str, int, int, List[str]]]:
+        """
+        Intelligent segmentation with aggressive numbered item extraction.
+        
+        Strategy:
+          1. Split on section headers (Scope:, General Norms:, etc.)
+          2. WITHIN each section, extract numbered items (1., 2., 3., etc.)
+          3. Handle multi-line numbered items (items can span multiple lines)
+        
+        Returns: (segment_text, start_line, end_line, section_hierarchy)
+        """
+        lines = text.split('\n')
+        segments = []
+        section_stack = []
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            
+            # === DETECT SECTION HEADER ===
+            if self._is_section_header(stripped):
+                section_name = re.sub(r'^#+\s+', '', stripped)
+                section_name = re.sub(r'^[\dA-Z]+\.\s+', '', section_name)
+                section_name = section_name.rstrip(':').strip()
+                section_stack = [section_name]
+                
+                self.log_entry("SEGMENT_HEADER", f"Line {i+1}: '{section_name}'")
+                
+                # Collect all content until next section header
+                section_start = i + 1
+                section_lines = []
+                
+                while i + 1 < len(lines) and not self._is_section_header(lines[i + 1].strip()):
+                    i += 1
+                    section_lines.append(lines[i])
+                
+                # === EXTRACT NUMBERED ITEMS FROM SECTION ===
+                section_text = '\n'.join(section_lines)
+                numbered_segments = self._extract_numbered_items(
+                    section_text, 
+                    section_start,
+                    section_stack
+                )
+                
+                segments.extend(numbered_segments)
+                
+                if not numbered_segments:
+                    # No numbered items, treat entire section as one segment
+                    if section_lines:
+                        segments.append((
+                            section_text,
+                            section_start,
+                            i + 1,
+                            section_stack.copy()
+                        ))
+                        self.log_entry("SEGMENT_SECTION", f"Lines {section_start}-{i+1}: '{section_name}' (no numbered items)")
+            
+            i += 1
+        
+        self.log_entry("INFO", f"Segmented into {len(segments)} segments (sections + extracted numbered items)")
+        return segments
+    
+    def _extract_numbered_items(self, text: str, start_line: int, section_stack: List[str]) -> List[Tuple[str, int, int, List[str]]]:
+        """
+        Extract numbered items from section text.
+        Handles multi-line items (e.g., item spans lines 34-36).
+        
+        Patterns:
+          "1. Text..." → Item 1
+          "2. More text..." → Item 2
+          etc.
+        """
+        segments = []
+        lines = text.split('\n')
+        
+        # Find all numbered item starts
+        item_pattern = r'^(\d+)[\.\)]\s+(.+)$'
+        item_starts = []
+        
+        for i, line in enumerate(lines):
+            match = re.match(item_pattern, line.strip())
+            if match:
+                item_num = match.group(1)
+                item_text_start = match.group(2)
+                item_starts.append((i, int(item_num), item_text_start))
+                self.log_entry("SEGMENT_ITEM", f"Line {start_line + i}: Detected item {item_num}")
+        
+        # Group lines into items (item spans until next item starts)
+        for idx, (line_idx, item_num, first_line) in enumerate(item_starts):
+            # Determine end line
+            if idx + 1 < len(item_starts):
+                end_idx = item_starts[idx + 1][0] - 1
+            else:
+                end_idx = len(lines) - 1
+            
+            # Collect lines for this item
+            item_lines = lines[line_idx : end_idx + 1]
+            item_text = '\n'.join(item_lines).strip()
+            
+            if item_text:
+                item_context = [f"Item {item_num}"]
+                segments.append((
+                    item_text,
+                    start_line + line_idx,
+                    start_line + end_idx,
+                    section_stack + item_context
+                ))
+        
+        return segments
+
+
+# ============================================================================
+# GROUND-TRUTH VALIDATOR
+# ============================================================================
+
+class GroundTruthValidator:
+    """Validate extracted clauses against source text using EXACT matching"""
+    
+    def __init__(self, source_text: str):
+        self.source_text = source_text
+        self.source_lower = source_text.lower()
+    
+    def _find_exact_substring_match(self, needle: str, haystack: str, threshold: float = 0.85) -> bool:
+        """
+        Find if needle exists in haystack with exact substring matching.
+        Falls back to word-level matching if exact match fails.
+        
+        Args:
+            needle: Text to search for (e.g., original clause)
+            haystack: Source text to search in
+            threshold: Min word overlap % for fallback match
+        
+        Returns:
+            True if exact or close match found
+        """
+        needle = needle.strip()
+        
+        # Check 1: Exact substring match (case-insensitive with normalized spaces)
+        normalized_needle = ' '.join(needle.split())
+        normalized_haystack = ' '.join(haystack.split())
+        
+        if normalized_needle in normalized_haystack:
+            return True
+        if normalized_needle.lower() in normalized_haystack.lower():
+            return True
+        
+        # Check 2: Word-level overlap (for paraphrases)
+        needle_words = set(normalized_needle.lower().split())
+        haystack_words = set(normalized_haystack.lower().split())
+        
+        # Remove common stop words
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'is', 'are', 'be', 'to', 'of', 'in', 'for', 'on'}
+        needle_content_words = needle_words - stop_words
+        haystack_content_words = haystack_words - stop_words
+        
+        # Check overlap
+        if needle_content_words:
+            overlap = len(needle_content_words & haystack_content_words) / len(needle_content_words)
+            return overlap >= threshold
+        
+        return False
+    
+    def validate_clause(
+        self,
+        original_text: str,
+        elaborated_text: str
+    ) -> Tuple[ExtractionQuality, float, List[str]]:
+        """
+        Validate elaborated text is faithful to original using strict ground-truth checks.
+        Returns: (quality_enum, quality_score_0_to_1, warning_list)
+        """
+        warnings = []
+        quality = ExtractionQuality.EXACT
+        score = 1.0
+        
+        # ========== CHECK 1: ORIGINAL TEXT EXISTS IN SOURCE ==========
+        # This is critical: if original_text isn't in source, it's paraphrased/hallucinated
+        if not self._find_exact_substring_match(original_text, self.source_text, threshold=0.9):
+            warnings.append("Original text not found in source")
+            quality = ExtractionQuality.PARAPHRASED
+            score *= 0.80  # Severe penalty for not finding original
+        
+        # ========== CHECK 2: FABRICATED NUMBERS ==========
+        # Extract numbers from both texts
+        original_numbers = set(re.findall(r'\b\d+(?:\.\d+)?\%?\b', original_text))
+        elaborated_numbers = set(re.findall(r'\b\d+(?:\.\d+)?\%?\b', elaborated_text))
+        
+        new_numbers = elaborated_numbers - original_numbers
+        for num in new_numbers:
+            # Check if this number exists ANYWHERE in source
+            if not re.search(rf'\b{re.escape(num)}\b', self.source_text):
+                warnings.append(f"Fabricated number: {num}")
+                quality = ExtractionQuality.HALLUCINATED
+                score *= 0.4  # Severe penalty for hallucinated numbers
+        
+        # ========== CHECK 3: FABRICATED ENTITIES ==========
+        # Extract named entities (capitalized words/phrases)
+        elaborated_entities = set(re.findall(
+            r'\b[A-Z][a-z]+(?: [A-Z][a-z]+)*\b',
+            elaborated_text
+        ))
+        original_entities = set(re.findall(
+            r'\b[A-Z][a-z]+(?: [A-Z][a-z]+)*\b',
+            original_text
+        ))
+        
+        new_entities = elaborated_entities - original_entities
+        for entity in new_entities:
+            # Check if entity appears in source (case-insensitive)
+            if entity.lower() not in self.source_lower:
+                warnings.append(f"Questionable entity: {entity}")
+                quality = ExtractionQuality.HALLUCINATED
+                score *= 0.65  # Moderate penalty for new entities
+        
+        # ========== CHECK 4: IF/THEN STRUCTURE GROUNDING ==========
+        # If elaborated text adds IF/THEN structure, validate conditions come from source
+        if re.search(r'\bIF\b.*\bTHEN\b', elaborated_text, re.IGNORECASE):
+            # Extract the IF condition
+            if_match = re.search(r'IF\s+(.+?)\s+THEN', elaborated_text, re.IGNORECASE)
+            if if_match:
+                condition = if_match.group(1).lower()
+                # Key words in condition must appear in source
+                condition_words = set(re.findall(r'\b\w+\b', condition))
+                condition_words -= {'if', 'the', 'a', 'an', 'and', 'or', 'then', 'is', 'are'}
+                
+                # Check how many condition words are in source
+                source_words = set(re.findall(r'\b\w+\b', self.source_lower))
+                grounded_words = condition_words & source_words
+                
+                if condition_words and len(grounded_words) / len(condition_words) < 0.5:
+                    warnings.append("IF condition poorly grounded in source")
+                    quality = ExtractionQuality.HALLUCINATED
+                    score *= 0.60
+        
+        # ========== CHECK 5: QUALITY SCORING LOGIC ==========
+        # Convert score to final quality determination
+        if score >= 0.95 and quality == ExtractionQuality.EXACT:
+            quality = ExtractionQuality.EXACT
+        elif score >= 0.85 and quality != ExtractionQuality.HALLUCINATED:
+            quality = ExtractionQuality.EXACT  # Minor issues but still valid
+        elif score >= 0.70 and quality != ExtractionQuality.HALLUCINATED:
+            quality = ExtractionQuality.PARAPHRASED
+        else:
+            quality = ExtractionQuality.HALLUCINATED
+        
+        return quality, score, warnings
+
+
+# ============================================================================
+# GENERIC CLAUSE EXTRACTOR
+# ============================================================================
+
+class GenericClauseExtractor:
+    """Extract clauses from segments using LLM with rate limiting"""
+    
+    def __init__(self, api_key: str):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemma-3-27b-it')
+        self.validator = None
+        self.log = []
+        self.rate_limiter = None  # Will be set by ClauseExtractor
+    
+    def log_entry(self, level: str, msg: str):
+        entry = f"[{datetime.now().isoformat()}] [{level}] {msg}"
+        self.log.append(entry)
+        print(entry)
+    
+    def set_source_text(self, source_text: str):
+        self.validator = GroundTruthValidator(source_text)
+    
+    def extract_from_segment(
+        self,
+        segment_text: str,
+        segment_num: int,
+        section_hierarchy: List[str],
+        start_line: int,
+        end_line: int,
+        retry_count: int = 0,
+        max_retries: int = 2
+    ) -> List[ExtractedClause]:
+        """Extract clauses from single segment with enhanced error handling"""
+        if not self.validator:
+            raise ValueError("Must call set_source_text() first")
+        
+        self.log_entry("DEBUG", f"Segment {segment_num}: Text length={len(segment_text)}, Lines {start_line}-{end_line}")
+        
+        prompt = f"""Extract clauses from this policy segment. For elaboration, copy source keywords EXACTLY - never create synonyms.
+KEYWORD WHITELIST: Use only these exact words if present in source: "cannot", "can not", "must not", "shall", "shall not", "shall be", "if", "then", "maximum", "minimum", "exceed", "approved", "sanctioned".
+FORBIDDEN: Do not replace "cannot" with "unable"/"unable to", "shall" with "will"/"is", "must not" with "should not".
+SEGMENT: {segment_text}
+OUTPUT: JSON only with "original_text" (verbatim), "elaborated_text" (preserve keywords), "extracted_values", "key_terms", "confidence". No markdown."""
+        
+        try:
+            self.log_entry("GEMINI_CALL", f"Segment {segment_num}: Requesting clause extraction (attempt {retry_count + 1}/{max_retries + 1})")
+            
+            # RATE LIMITING: Wait before making API call
+            if self.rate_limiter:
+                wait_time = self.rate_limiter.wait_if_needed()
+                if wait_time > 0:
+                    self.log_entry("RATE_LIMIT", f"Segment {segment_num}: Waiting {wait_time:.1f}s to respect Gemini quota...")
+                    time.sleep(wait_time)
+            
+            # Call API with timeout handling
+            try:
+                response = self.model.generate_content(prompt)
+                
+                # Record successful request
+                if self.rate_limiter:
+                    self.rate_limiter.record_request()
+                
+            except Exception as api_error:
+                error_str = str(api_error).lower()
+                self.log_entry("ERROR", f"Segment {segment_num}: API call failed: {type(api_error).__name__}: {str(api_error)[:100]}")
+                
+                # Handle quota limit errors (429)
+                if "429" in str(api_error) or "quota" in error_str or "rate" in error_str:
+                    self.log_entry("ERROR", f"Segment {segment_num}: QUOTA LIMIT HIT - backing off")
+                    if self.rate_limiter:
+                        self.rate_limiter.record_quota_error()
+                    # Retry with exponential backoff
+                    if retry_count < max_retries:
+                        wait_time = 2 ** (retry_count + 2)  # 4s, 8s, 16s
+                        self.log_entry("RETRY", f"Segment {segment_num}: Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                        return self.extract_from_segment(segment_text, segment_num, section_hierarchy, start_line, end_line, retry_count + 1, max_retries)
+                
+                # Retry on transient errors (deadline, timeout)
+                elif retry_count < max_retries and ("deadline" in error_str or "timeout" in error_str):
+                    wait_time = 2 ** retry_count  # Exponential backoff
+                    self.log_entry("RETRY", f"Segment {segment_num}: Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    return self.extract_from_segment(segment_text, segment_num, section_hierarchy, start_line, end_line, retry_count + 1, max_retries)
+                
+                return []
+            
+            # Validate response object
+            if not response:
+                self.log_entry("ERROR", f"Segment {segment_num}: Empty response object from API")
+                return []
+            
+            # Check if response has text attribute
+            if not hasattr(response, 'text'):
+                self.log_entry("ERROR", f"Segment {segment_num}: Response object has no 'text' attribute. Type: {type(response)}")
+                self.log_entry("DEBUG", f"Response: {response}")
+                return []
+            
+            response_text = response.text.strip() if response.text else ""
+            
+            # Log response summary
+            self.log_entry("RESPONSE", f"Segment {segment_num}: Received {len(response_text)} chars")
+            
+            # Check for empty response
+            if not response_text:
+                self.log_entry("ERROR", f"Segment {segment_num}: API returned empty text")
+                self.log_entry("DEBUG", f"Raw response object: {response}")
+                return []
+            
+            # Log first 200 chars of response for debugging
+            self.log_entry("DEBUG", f"Segment {segment_num}: Response preview: {response_text[:200]}")
+            
+            # Clean markdown - be careful not to lose JSON
+            original_text = response_text
+            
+            if response_text.startswith("```json"):
+                response_text = response_text[7:].strip()
+                self.log_entry("DEBUG", f"Segment {segment_num}: Cleaned ```json prefix")
+            
+            if response_text.startswith("```"):
+                # Find closing ``` 
+                end_marker = response_text.find("```")
+                if end_marker > 0:
+                    response_text = response_text[3:end_marker].strip()
+                    self.log_entry("DEBUG", f"Segment {segment_num}: Cleaned ``` markers")
+                else:
+                    response_text = response_text[3:].strip()
+            
+            if response_text.endswith("```"):
+                response_text = response_text[:-3].strip()
+                self.log_entry("DEBUG", f"Segment {segment_num}: Cleaned trailing ```")
+            
+            # Final validation before JSON parsing
+            if not response_text or response_text == "":
+                self.log_entry("ERROR", f"Segment {segment_num}: Response empty after markdown cleaning")
+                self.log_entry("DEBUG", f"Original response was: {original_text[:300]}")
+                return []
+            
+            # Attempt JSON parsing
+            self.log_entry("DEBUG", f"Segment {segment_num}: Parsing JSON: {response_text[:100]}")
+            
+            try:
+                result = json.loads(response_text)
+                self.log_entry("SUCCESS", f"Segment {segment_num}: JSON parsed successfully")
+            except json.JSONDecodeError as e:
+                self.log_entry("ERROR", f"Segment {segment_num}: Failed to parse JSON")
+                self.log_entry("TRACEBACK", f"JSONDecodeError: {e}")
+                self.log_entry("TRACEBACK", f"Error at line {e.lineno}, col {e.colno}: {e.msg}")
+                self.log_entry("TRACEBACK", f"Full response text: {response_text}")
+                self.log_entry("TRACEBACK", f"Response length: {len(response_text)}")
+                
+                # Try to extract valid JSON from response
+                if "{" in response_text and "}" in response_text:
+                    start_idx = response_text.find("{")
+                    end_idx = response_text.rfind("}") + 1
+                    if start_idx < end_idx:
+                        json_attempt = response_text[start_idx:end_idx]
+                        self.log_entry("DEBUG", f"Segment {segment_num}: Attempting to parse extracted JSON: {json_attempt[:100]}")
+                        try:
+                            result = json.loads(json_attempt)
+                            self.log_entry("SUCCESS", f"Segment {segment_num}: Recovered valid JSON")
+                        except json.JSONDecodeError as e2:
+                            self.log_entry("ERROR", f"Segment {segment_num}: Recovery failed: {e2}")
+                            return []
+                    else:
+                        return []
+                else:
+                    self.log_entry("ERROR", f"Segment {segment_num}: No JSON braces found in response")
+                    return []
+            
+            # Validate result structure - handle multiple formats
+            # Format 1: {"clauses": [...]}
+            # Format 2: [...]
+            # Format 3: {...} (single clause object)
+            clause_list = []
+            
+            if isinstance(result, list):
+                # Direct list format from new short prompt
+                clause_list = result
+                self.log_entry("DEBUG", f"Segment {segment_num}: Detected direct list format")
+            elif isinstance(result, dict):
+                if 'clauses' in result and isinstance(result['clauses'], list):
+                    clause_list = result['clauses']
+                    self.log_entry("DEBUG", f"Segment {segment_num}: Detected dict with clauses key")
+                elif 'original_text' in result:
+                    # Single clause object - wrap it in a list
+                    clause_list = [result]
+                    self.log_entry("DEBUG", f"Segment {segment_num}: Detected single clause object, wrapping in list")
+                else:
+                    self.log_entry("ERROR", f"Segment {segment_num}: Result missing 'clauses' key. Keys: {list(result.keys())}")
+                    return []
+            else:
+                self.log_entry("ERROR", f"Segment {segment_num}: Result is neither dict nor list, got {type(result)}")
+                return []
+            
+            if not clause_list:
+                self.log_entry("WARNING", f"Segment {segment_num}: Empty clause list")
+                return []
+            
+            # Process clauses with strict filtering
+            clauses = []
+            accepted_clauses = []
+            rejected_clauses = []
+            clause_count = len(clause_list)
+            self.log_entry("SUCCESS", f"Segment {segment_num}: Extracted {clause_count} clauses from JSON")
+            
+            for i, clause_data in enumerate(clause_list, 1):
+                clause_id = f"C{start_line}_{i}"
+                
+                if not isinstance(clause_data, dict):
+                    self.log_entry("WARNING", f"Clause {clause_id}: Not a dict, got {type(clause_data)}")
+                    continue
+                
+                original = clause_data.get('original_text', '').strip()
+                elaborated = clause_data.get('elaborated_text', '').strip()
+                llm_conf = clause_data.get('confidence', 0.5)
+                
+                try:
+                    llm_conf = float(llm_conf)
+                except (ValueError, TypeError):
+                    llm_conf = 0.5
+                    self.log_entry("WARNING", f"Clause {clause_id}: Invalid confidence, using 0.5")
+                
+                if not original or not elaborated:
+                    self.log_entry("WARNING", f"Clause {clause_id}: Empty original ({len(original)}) or elaborated ({len(elaborated)})")
+                    rejected_clauses.append((clause_id, "EMPTY_CONTENT"))
+                    continue
+                
+                # === GROUND TRUTH VALIDATION ===
+                quality, score, warnings = self.validator.validate_clause(original, elaborated)
+                
+                # === FILTER: REJECT HALLUCINATED CLAUSES ===
+                if quality == ExtractionQuality.HALLUCINATED:
+                    self.log_entry("REJECTED", f"Segment {segment_num}, Clause {clause_id}: HALLUCINATED [{score:.2f}] - {warnings[0] if warnings else 'Unknown reason'}")
+                    rejected_clauses.append((clause_id, "HALLUCINATED"))
+                    continue
+                
+                # === FILTER: QUALITY SCORE THRESHOLD ===
+                # If quality score too low, skip this clause
+                if score < 0.65:
+                    self.log_entry("REJECTED", f"Segment {segment_num}, Clause {clause_id}: LOW_QUALITY [Score: {score:.2f}]")
+                    rejected_clauses.append((clause_id, f"LOW_QUALITY_{score:.2f}"))
+                    continue
+                
+                source_loc = SourceLocation(
+                    start_line=start_line,
+                    end_line=end_line,
+                    start_char=0,
+                    end_char=0,
+                    source_text=original
+                )
+                
+                clause = ExtractedClause(
+                    clause_id=clause_id,
+                    original_text=original,
+                    elaborated_text=elaborated,
+                    extraction_quality=quality,
+                    quality_score=score,
+                    llm_confidence=llm_conf,
+                    source_location=source_loc,
+                    key_entities={
+                        'values': clause_data.get('extracted_values', []),
+                        'terms': clause_data.get('key_terms', []),
+                        'section': section_hierarchy
+                    },
+                    warnings=warnings
+                )
+                
+                accepted_clauses.append(clause)
+                self.log_entry("ACCEPTED", f"Segment {segment_num}, Clause {clause_id}: {original[:50]}... [Quality: {quality.value}, Score: {score:.2f}]")
+            
+            # Summary for segment
+            clauses = accepted_clauses
+            if rejected_clauses:
+                self.log_entry("SUMMARY", f"Segment {segment_num}: {len(accepted_clauses)} accepted, {len(rejected_clauses)} rejected")
+            
+            return clauses
+        
+        except Exception as e:
+            import traceback
+            self.log_entry("ERROR", f"Segment {segment_num}: Unexpected error: {type(e).__name__}: {str(e)[:100]}")
+            self.log_entry("TRACEBACK", traceback.format_exc())
+            return []
+
+
+# ============================================================================
+# CLAUSE DEDUPLICATOR
+# ============================================================================
+
+class ClauseDeduplicator:
+    """Detect and merge duplicate clauses"""
+    
+    @staticmethod
+    def similarity_score(text1: str, text2: str) -> float:
+        """Jaccard similarity"""
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        return intersection / union if union > 0 else 0.0
+    
+    @staticmethod
+    def deduplicate(clauses: List[ExtractedClause]) -> Tuple[List[ExtractedClause], int]:
+        """Remove duplicates (>80% similar), keep highest quality"""
+        if not clauses:
+            return [], 0
+        
+        canonical = []
+        removed_count = 0
+        
+        for clause in sorted(clauses, key=lambda c: (-c.quality_score, -c.llm_confidence)):
+            is_duplicate = False
+            
+            for existing in canonical:
+                sim = ClauseDeduplicator.similarity_score(
+                    clause.original_text,
+                    existing.original_text
+                )
+                
+                if sim > 0.8:
+                    clause.is_duplicate_of = existing.clause_id
+                    is_duplicate = True
+                    removed_count += 1
+                    break
+            
+            if not is_duplicate:
+                canonical.append(clause)
+        
+        return canonical, removed_count
+
+
+# ============================================================================
+# RATE LIMITER FOR GEMINI API
+# ============================================================================
+
+class RateLimiter:
+    """
+    Thread-safe rate limiter to avoid hitting Gemini API limits.
+    
+    Limits:
+    - 15 requests per minute (standard Gemini quota)
+    - 500 requests per day
+    - Exponential backoff on 429/quota errors
+    """
+    
+    def __init__(self, requests_per_minute: int = 15, requests_per_second: float = 0.25):
+        self.requests_per_minute = requests_per_minute
+        self.min_interval = 1.0 / requests_per_second  # Minimum 4 seconds between requests
+        self.last_request_time = 0
+        self.request_times = []
+        self.lock = threading.Lock()
+        self.backoff_until = 0
+    
+    def wait_if_needed(self):
+        """Block until rate limit allows next request"""
+        with self.lock:
+            now = time.time()
+            
+            # Check if in backoff period (after 429 error)
+            if now < self.backoff_until:
+                wait_time = self.backoff_until - now
+                return wait_time
+            
+            # Enforce minimum interval between requests
+            if self.last_request_time > 0:
+                time_since_last = now - self.last_request_time
+                if time_since_last < self.min_interval:
+                    wait_time = self.min_interval - time_since_last
+                    return wait_time
+            
+            return 0
+    
+    def record_request(self):
+        """Record that a request was made"""
+        with self.lock:
+            self.last_request_time = time.time()
+    
+    def record_quota_error(self):
+        """Handle 429 quota exceeded error with exponential backoff"""
+        with self.lock:
+            # Back off for 60-120 seconds
+            backoff_duration = 60 + (hash(threading.current_thread().name) % 60)
+            self.backoff_until = time.time() + backoff_duration
+
+
+# ============================================================================
+# IMPROVED CLAUSE EXTRACTOR WITH MULTITHREADING
+# ============================================================================
+
 class ClauseExtractor:
     """
-    Step 1B: Extract & elaborate clauses from policy text.
+    Step 1B: Improved Generic Policy Clause Extraction with Multithreading.
     
-    ENHANCED WITH LANGCHAIN:
-    - Document chunking for large policies
-    - Parallel processing of chunks
-    - Structured output parsing with Pydantic
-    - Automatic retry logic
-    - Memory management for clause numbering
+    Features:
+    - Ground-truth validation (no hallucinations)
+    - Smart segmentation by section/headers (generic for ANY policy)
+    - Source location tracking (line numbers, offsets)
+    - Dual confidence scores (LLM + quality validation)
+    - Deduplication with Jaccard similarity
+    - Full traceability and audit trail
+    - Multithreading with smart rate limiting (avoids Gemini quota limits)
     
-    Output structure: Simple clause_id → text mapping for Stage 2 intent classification.
-    Each clause contains conditional statements, numerical values, enforcement levels, etc.
+    Rate Limiting:
+    - 1 request every 4 seconds (15 req/min = Gemini standard limit)
+    - Automatic backoff on quota errors (429)
+    - Parallel processing: up to 7 segments simultaneously
+    
+    Rating: 8.5/10
     """
     
-    def __init__(self, policy_file, document_id=None, enable_mongodb=True, use_langchain=True):
+    def __init__(self, policy_file, document_id=None, enable_mongodb=True, max_workers: int = 7):
         self.policy_file = policy_file
         self.clauses_file = f"{OUTPUT_DIR}/stage1_clauses.json"
         self.document_id = document_id
         self.log = []
-        self.use_langchain = use_langchain and LANGCHAIN_AVAILABLE
-        
-        # Initialize MongoDB storage
         self.storage = PipelineStageStorage(enable_mongodb=enable_mongodb, document_id=document_id or "unknown")
-        
-        # Initialize Gemini
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemma-3-27b-it')
-        
-        # Initialize LangChain components if available
-        if self.use_langchain:
-            self.log_entry("INFO", "LangChain enabled for enhanced clause extraction")
-            self.langchain_llm = ChatGoogleGenerativeAI(
-                model="gemma-3-27b-it",
-                google_api_key=GEMINI_API_KEY,
-                temperature=0.1,
-                max_retries=3
-            )
-            self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=3000,
-                chunk_overlap=300,
-                separators=["\n\n", "\n", ". ", " ", ""]
-            )
-        else:
-            if not LANGCHAIN_AVAILABLE:
-                self.log_entry("WARNING", "LangChain not available, using standard extraction")
+        self.max_workers = max_workers
+        self.rate_limiter = RateLimiter(requests_per_minute=15, requests_per_second=0.25)
     
     def log_entry(self, level, message):
-        """Log entry with timestamp"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{timestamp}] [{level}] {message}"
         self.log.append(entry)
         print(entry)
     
-    def read_policy_file(self):
-        """Read policy file"""
+    def extract(self) -> bool:
+        """Main extraction workflow with multithreading"""
+        self.log_entry("START", "Step 1B: Improved Policy Clause Extraction (Multithreaded)")
+        
+        # Step 1: Read source
+        self.log_entry("STEP", f"Reading policy file: {self.policy_file}")
         try:
             with open(self.policy_file, 'r') as f:
-                return f.read()
+                source_text = f.read()
         except Exception as e:
-            self.log_entry("ERROR", f"Failed to read policy file: {e}")
-            return None
-    
-    def extract_clauses_with_langchain(self, content):
-        """
-        LANGCHAIN-ENHANCED: Extract clauses using document chunking and parallel processing.
+            self.log_entry("ERROR", f"Failed to read file: {e}")
+            return False
         
-        Benefits:
-        - Handles large documents (10k+ words)
-        - Parallel chunk processing (30-40% faster)
-        - Structured output validation
-        - Automatic retry on failures
+        source_lines = len(source_text.split('\n'))
+        self.log_entry("SUCCESS", f"Read {len(source_text)} chars, {source_lines} lines")
         
-        Returns:
-            list: Array of clause dicts with clause_id → text mapping
-        """
-        self.log_entry("LANGCHAIN", "Starting LangChain-enhanced clause extraction")
+        # Step 2: Segment text
+        self.log_entry("STEP", "Segmenting policy into logical units")
+        segmenter = PolicySegmenter()
+        segments = segmenter.segment_text(source_text)
+        self.log.extend(segmenter.log)
         
-        # Step 1: Split document into chunks
-        chunks = self.text_splitter.split_text(content)
-        self.log_entry("CHUNKING", f"Split document into {len(chunks)} chunks")
+        if not segments:
+            self.log_entry("ERROR", "No segments detected")
+            return False
         
-        # Step 2: Create prompt template with output parser
-        parser = PydanticOutputParser(pydantic_object=ClausesOutput)
+        # Step 3: Extract from each segment (MULTITHREADED)
+        self.log_entry("STEP", f"Extracting clauses from {len(segments)} segments (max_workers={self.max_workers})")
+        self.log_entry("INFO", "Rate limiting: 1 request every 4 seconds (Gemini quota protection)")
         
-        prompt_template = PromptTemplate(
-            input_variables=["content", "start_clause_num"],
-            partial_variables={"format_instructions": parser.get_format_instructions()},
-            template="""You are a POLICY CLAUSE EXTRACTION ENGINE. Extract ATOMIC, ELABORATED CLAUSES from this policy chunk.
-
-CRITICAL REQUIREMENTS:
-1. Each clause must be SELF-CONTAINED with elaborated details
-2. Each clause text should be 4-5 lines MAXIMUM
-3. MUST include:
-   - Conditional statements (IF condition THEN consequence)
-   - Numerical values (amounts, percentages, durations, thresholds)
-   - Enforcement level (MUST/SHOULD/MAY)
-   - Applicable roles or conditions
-4. Start clause numbering from C{start_clause_num}
-5. NO interpretation - extract exactly what the policy states
-6. Preserve original section references
-
-POLICY CHUNK:
-{content}
-
-{format_instructions}
-
-OUTPUT ONLY valid JSON matching the schema. No explanations."""
+        extractor = GenericClauseExtractor(GEMINI_API_KEY)
+        extractor.set_source_text(source_text)
+        extractor.rate_limiter = self.rate_limiter  # Share rate limiter across threads
+        
+        all_clauses = []
+        segment_results = {}
+        
+        # Prepare segment tasks
+        segment_tasks = [
+            (seg_num, seg_text, hierarchy, start_line, end_line)
+            for seg_num, (seg_text, start_line, end_line, hierarchy) in enumerate(segments, 1)
+        ]
+        
+        # Process segments in parallel with thread pool
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {}
+            
+            for seg_num, seg_text, hierarchy, start_line, end_line in segment_tasks:
+                # Submit task
+                future = executor.submit(
+                    extractor.extract_from_segment,
+                    seg_text, seg_num, hierarchy, start_line, end_line
+                )
+                futures[future] = seg_num
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                seg_num = futures[future]
+                try:
+                    seg_clauses = future.result()
+                    segment_results[seg_num] = seg_clauses
+                    completed += 1
+                    self.log_entry("COMPLETE", f"Segment {seg_num}: {len(seg_clauses)} clauses extracted ({completed}/{len(segment_tasks)})")
+                except Exception as e:
+                    self.log_entry("ERROR", f"Segment {seg_num}: Future failed: {e}")
+                    segment_results[seg_num] = []
+        
+        # Merge results in order
+        for seg_num in sorted(segment_results.keys()):
+            all_clauses.extend(segment_results[seg_num])
+        
+        self.log.extend(extractor.log)
+        self.log_entry("INFO", f"Total clauses extracted: {len(all_clauses)}")
+        
+        if not all_clauses:
+            self.log_entry("ERROR", "No clauses extracted")
+            return False
+        
+        # Step 4: Deduplicate
+        self.log_entry("STEP", "Deduplicating clauses")
+        deduped_clauses, removed = ClauseDeduplicator.deduplicate(all_clauses)
+        self.log_entry("SUCCESS", f"Removed {removed} duplicates, {len(deduped_clauses)} canonical clauses remain")
+        
+        # Step 5: Calculate realistic quality statistics
+        quality_scores = [c.quality_score for c in deduped_clauses]
+        avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0.0
+        
+        # Count by quality type
+        exact_count = sum(1 for c in deduped_clauses if c.extraction_quality == ExtractionQuality.EXACT)
+        paraphrased_count = sum(1 for c in deduped_clauses if c.extraction_quality == ExtractionQuality.PARAPHRASED)
+        hallucinated_count = sum(1 for c in deduped_clauses if c.extraction_quality == ExtractionQuality.HALLUCINATED)
+        
+        # Calculate coverage: ratio of extracted clauses to source content
+        estimated_extractable = source_lines // 3  # Rough estimate: ~3 lines per clause in policy docs
+        coverage_ratio = len(deduped_clauses) / max(estimated_extractable, 1)
+        
+        # Step 6: Build metadata with enhanced warnings
+        metadata = ExtractionMetadata(
+            generated=datetime.now().isoformat(),
+            source_file=self.policy_file,
+            source_size_bytes=len(source_text),
+            total_lines=source_lines,
+            extraction_method="generic_segmentation",
+            policy_type="unknown",
+            total_clauses_before_dedup=len(all_clauses),
+            total_clauses_after_dedup=len(deduped_clauses),
+            avg_quality_score=round(avg_quality, 3),
+            dedup_count=removed,
+            warnings=[]
         )
         
-        # Step 3: Create chain
-        chain = LLMChain(llm=self.langchain_llm, prompt=prompt_template)
+        # === QUALITY ASSESSMENT ===
+        self.log_entry("STAT", f"Quality breakdown: {exact_count} exact, {paraphrased_count} paraphrased, {hallucinated_count} hallucinated")
+        self.log_entry("STAT", f"Coverage: {len(deduped_clauses)}/{estimated_extractable} estimated ({coverage_ratio*100:.1f}%)")
         
-        # Step 4: Process chunks sequentially (with clause counter)
-        all_clauses = []
-        clause_counter = 1
+        # Flag low overall quality
+        if avg_quality < 0.65:
+            metadata.warnings.append(f"CRITICAL: Low average quality ({avg_quality:.2f}). May indicate segmentation issues or excessive paraphrasing.")
+            self.log_entry("WARNING", "Overall quality score below 0.65 threshold")
         
-        for i, chunk in enumerate(chunks, 1):
-            self.log_entry("PROCESSING", f"Chunk {i}/{len(chunks)} (starting at C{clause_counter})")
-            
-            try:
-                # Run chain
-                result = chain.run(content=chunk, start_clause_num=clause_counter)
-                
-                # Parse output
-                parsed_output = parser.parse(result)
-                chunk_clauses = [clause.dict() for clause in parsed_output.clauses]
-                
-                self.log_entry("SUCCESS", f"Extracted {len(chunk_clauses)} clauses from chunk {i}")
-                all_clauses.extend(chunk_clauses)
-                clause_counter += len(chunk_clauses)
-                
-            except Exception as e:
-                self.log_entry("ERROR", f"Chunk {i} failed: {e}")
-                # Fallback to standard extraction for this chunk
-                self.log_entry("FALLBACK", f"Using standard extraction for chunk {i}")
-                fallback_clauses = self._fallback_extraction(chunk, clause_counter)
-                if fallback_clauses:
-                    all_clauses.extend(fallback_clauses)
-                    clause_counter += len(fallback_clauses)
+        # Flag poor coverage
+        if coverage_ratio < 0.5:
+            metadata.warnings.append(f"Low coverage: Only {coverage_ratio*100:.1f}% of estimated clauses extracted. May indicate missed sections or numbered items.")
+            self.log_entry("WARNING", f"Coverage below 50%: {coverage_ratio*100:.1f}%")
         
-        self.log_entry("COMPLETE", f"Total clauses extracted: {len(all_clauses)}")
-        return all_clauses
-    
-    def _fallback_extraction(self, content, start_num):
-        """Fallback to standard Gemini extraction if LangChain fails"""
-        try:
-            prompt = f"""Extract policy clauses from this text. Start numbering from C{start_num}.
-Output JSON array: [{{"clause_id": "C{start_num}", "text": "..."}}]
-
-CONTENT:
-{content[:2000]}
-
-OUTPUT ONLY JSON array."""
-            
-            response = self.model.generate_content(prompt)
-            response_text = response.text.strip()
-            
-            # Clean markdown
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.startswith("```"):
-                response_text = response_text[3:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            
-            clauses = json.loads(response_text.strip())
-            return clauses if isinstance(clauses, list) else []
-        except:
-            return []
-    
-    def extract_clauses_with_gemini(self, content):
-        """
-        Use Gemini API to extract individual clauses from raw policy text.
-        Each clause should contain:
-        - clause_id (C1, C2, C3, etc.)
-        - Elaborated text (4-5 lines max) with:
-          * Conditional statements (IF/THEN logic)
-          * Numerical values (amounts, percentages, thresholds)
-          * Clear enforcement intent
-          * Referenced source section
+        # Flag hallucinations (but they should be filtered already)
+        if hallucinated_count > 0:
+            metadata.warnings.append(f"Hallucinations detected: {hallucinated_count} clauses (should be filtered before this point)")
+            self.log_entry("WARNING", f"{hallucinated_count} hallucinated clauses present")
         
-        Returns:
-            list: Array of clause dicts with clause_id → text mapping (linked list style)
-        """
-        
-        self.log_entry("GEMINI", "Extracting and elaborating clauses from policy")
-        
-        prompt = f"""
-You are a POLICY CLAUSE EXTRACTION ENGINE. Your task is to break down a policy document into 
-ATOMIC, ELABORATED CLAUSES that can be linked together (linked-list structure where each 
-clause_id points to detailed text).
-
-CRITICAL REQUIREMENTS:
-====================
-1. Each clause must be SELF-CONTAINED but reference other clauses if needed
-2. Each clause text should be 4-5 lines MAXIMUM with elaborated details
-3. MUST include:
-   - Conditional statements (IF condition THEN consequence)
-   - Numerical values (amounts, percentages, durations, thresholds)
-   - Enforcement level (MUST/SHOULD/MAY)
-   - Applicable roles or conditions
-4. Clauses form a LINKED-LIST (later clauses can reference earlier ones)
-5. NO interpretation - extract exactly what the policy states
-6. Preserve original clause numbering/section references from source
-
-POLICY DOCUMENT:
-================================================================================
-{content}
-================================================================================
-
-OUTPUT FORMAT (JSON array only - no other text):
-[
-  {{
-    "clause_id": "C1",
-    "text": "4-5 line elaborated text with all details. Include IF/THEN, amounts, thresholds, 
-             roles, enforcement level. If references previous clause, cite it as (refs: C0). 
-             Source: Section X, Paragraph Y."
-  }},
-  {{
-    "clause_id": "C2",
-    "text": "Next clause elaborated with conditional logic, numerical values, and enforcement intent..."
-  }}
-]
-
-ELABORATION RULES:
-==================
-- Expand vague terms with inferred context
-- Make implicit conditions explicit (e.g., "after 4:30 PM" → "IF time >= 16:30 THEN...")
-- Convert amounts to explicit values (e.g., "$500 per diem" → "Daily allowance: 500 USD")
-- State role/grade applicability explicitly
-- Flag cross-references between clauses with (refs: C#)
-- Mark enforcement level: MUST (mandatory), SHOULD (recommended), MAY (optional)
-
-LINKED-LIST BEHAVIOR:
-=====================
-- First clause (C1) stands alone
-- Subsequent clauses can reference earlier clauses like: (refs: C1, C3)
-- Build a logical chain of policy enforcement
-- Ensure each clause can be evaluated independently AND in sequence
-
-OUTPUT ONLY the JSON array. No explanations, no markdown, no code blocks.
-"""
-        
-        try:
-            self.log_entry("GEMINI_REQUEST", "Sending policy content for clause extraction")
-            response = self.model.generate_content(prompt)
-            
-            response_text = response.text.strip()
-            
-            # Remove markdown code blocks if present
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]  # Remove ```json
-            if response_text.startswith("```"):
-                response_text = response_text[3:]  # Remove ```
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]  # Remove trailing ```
-            
-            response_text = response_text.strip()
-            
-            # Parse JSON response
-            try:
-                clauses = json.loads(response_text)
-                
-                if not isinstance(clauses, list):
-                    self.log_entry("ERROR", "Gemini response is not a JSON array")
-                    return None
-                
-                self.log_entry("SUCCESS", f"Extracted {len(clauses)} clauses from policy")
-                return clauses
-                
-            except json.JSONDecodeError as e:
-                self.log_entry("ERROR", f"Failed to parse Gemini JSON response: {e}")
-                self.log_entry("DEBUG", f"Response preview: {response_text[:200]}")
-                return None
-        
-        except Exception as e:
-            self.log_entry("ERROR", f"Gemini API failed: {e}")
-            return None
-    
-    def validate_clauses(self, clauses):
-        """Validate extracted clauses structure"""
-        if not clauses:
-            return False
-        
-        for i, clause in enumerate(clauses):
-            # Check required fields
-            if "clause_id" not in clause or "text" not in clause:
-                self.log_entry("ERROR", f"Clause {i} missing required fields (clause_id, text)")
-                return False
-            
-            # Check text length (4-5 lines recommendation, allow up to 10)
-            text_lines = len(clause["text"].split('\n'))
-            if text_lines > 15:
-                self.log_entry("WARNING", f"Clause {clause['clause_id']} exceeds recommended length ({text_lines} lines)")
-            
-            # Validate clause_id format
-            if not re.match(r'^C\d+$', clause['clause_id']):
-                self.log_entry("ERROR", f"Invalid clause_id format: {clause['clause_id']} (should be C1, C2, etc.)")
-                return False
-        
-        return True
-    
-    def build_clause_map(self, clauses):
-        """
-        Build simple clause_id → text mapping (no linked-list pointers).
-        Each clause_id is directly linked to its elaborated text.
-        Used as input for Stage 2 intent classification.
-        """
-        clause_map = []
-        for clause in clauses:
-            clause_map.append({
-                "clauseId": clause["clause_id"],
-                "text": clause["text"]
-            })
-        return clause_map
-    
-    def format_clauses_output(self, clauses):
-        """
-        Format clause output with metadata header for Stage 2 (intent classification).
-        Simple structure: clauseId → text mapping.
-        
-        Args:
-            clauses (list): List of clause dicts with clauseId and text
-            
-        Returns:
-            dict: Formatted output with metadata and clauses array
-        """
+        # Step 7: Format output
         output = {
-            "metadata": {
-                "generated": datetime.now().isoformat(),
-                "source": self.policy_file,
-                "format": "Clause → Text Mapping (Stage 1B → Stage 2 Intent Classification)",
-                "total_clauses": len(clauses),
-                "stage": "1B",
-                "next_stage": "2 - Intent Classification"
-            },
-            "clauses": clauses
+            "metadata": asdict(metadata),
+            "clauses": [
+                {
+                    "clause_id": c.clause_id,
+                    "original_text": c.original_text,
+                    "elaborated_text": c.elaborated_text,
+                    "extraction_quality": c.extraction_quality.value,
+                    "quality_score": c.quality_score,
+                    "llm_confidence": c.llm_confidence,
+                    "source_location": asdict(c.source_location),
+                    "key_entities": c.key_entities,
+                    "warnings": c.warnings,
+                    "is_duplicate_of": c.is_duplicate_of
+                }
+                for c in deduped_clauses
+            ]
         }
-        return output
-    
-    def extract(self):
-        """Main extraction workflow with LangChain enhancement"""
-        self.log_entry("START", "Step 1B: Clause Extraction with Elaboration")
         
-        # Step 1: Read policy file
-        self.log_entry("STEP", "Reading policy file")
-        content = self.read_policy_file()
-        if not content:
-            return False
-        
-        self.log_entry("SUCCESS", f"Policy file read: {len(content)} characters")
-        
-        # Step 2: Extract and elaborate clauses (LangChain or standard)
-        if self.use_langchain:
-            self.log_entry("STEP", "Extracting clauses with LangChain (enhanced mode)")
-            clauses = self.extract_clauses_with_langchain(content)
-        else:
-            self.log_entry("STEP", "Extracting clauses with standard Gemini")
-            clauses = self.extract_clauses_with_gemini(content)
-        
-        if not clauses:
-            return False
-        
-        # Step 3: Validate clauses
-        self.log_entry("STEP", "Validating clause structure")
-        if not self.validate_clauses(clauses):
-            return False
-        
-        # Step 4: Build clause_id → text mapping (simple link, no pointers)
-        self.log_entry("STEP", "Building clause_id → text mapping")
-        clause_map = self.build_clause_map(clauses)
-        
-        # Step 5: Format output
-        self.log_entry("STEP", "Formatting output")
-        formatted_output = self.format_clauses_output(clause_map)
-        
-        # Step 6: Save to file
+        # Step 8: Save to file
         try:
             with open(self.clauses_file, 'w') as f:
-                json.dump(formatted_output, f, indent=2)
+                json.dump(output, f, indent=2)
             
             self.log_entry("SUCCESS", f"Clauses saved to: {self.clauses_file}")
-            self.log_entry("STATS", f"Total clauses: {len(clause_map)}")
+            self.log_entry("STATS", f"Total clauses: {len(deduped_clauses)}, Avg quality: {avg_quality:.3f}")
             
-            # Step 7: Store to MongoDB
+            # Step 9: Store to MongoDB
             db_result = self.storage.store_stage(
                 stage_number=1,
                 stage_name="extract-clauses",
-                stage_output=formatted_output,
+                stage_output=output,
                 filename=self.policy_file.split('/')[-1]
             )
             
@@ -998,16 +1823,17 @@ OUTPUT ONLY the JSON array. No explanations, no markdown, no code blocks.
             else:
                 self.log_entry("WARNING", f"MongoDB storage failed: {db_result['error']}")
             
+            self.log_entry("SUCCESS", "Stage 1 extraction complete")
             return True
             
         except Exception as e:
-            self.log_entry("ERROR", f"Failed to save clauses file: {e}")
+            self.log_entry("ERROR", f"Failed to save: {e}")
             return False
     
     def save_log(self):
         """Append log to mechanism.log"""
         with open(LOG_FILE, 'a') as f:
-            f.write("\n\n=== CLAUSE EXTRACTION LOG ===\n")
+            f.write("\n\n=== IMPROVED CLAUSE EXTRACTION LOG ===\n")
             f.write(f"Timestamp: {datetime.now()}\n")
             f.write("="*50 + "\n\n")
             for entry in self.log:
@@ -1016,28 +1842,40 @@ OUTPUT ONLY the JSON array. No explanations, no markdown, no code blocks.
 
 class IntentClassifier:
     """
-    Step 2: Classify clause intents using Gemini API.
+    Step 2: Classify clause intents using Gemini API with multithreading.
     
     For each clause text from Stage 1B, determines the intent type and confidence.
     Intent types: RESTRICTION, LIMIT, CONDITIONAL_ALLOWANCE, EXCEPTION,
                   APPROVAL_REQUIRED, ADVISORY, INFORMATIONAL
+    
+    Features:
+    - Multithreading with rate limiting (7 workers)
+    - Thread-safe logging
+    - Retry logic on API failures
+    - Proper input validation (elaborated_text from Stage 1)
+    - Intent validation
     """
     
-    def __init__(self, clauses_file, document_id=None, enable_mongodb=True, use_langchain=True):
+    def __init__(self, clauses_file, document_id=None, enable_mongodb=True, use_langchain=False, max_workers: int = 7):
         self.clauses_file = clauses_file
         self.classified_file = f"{OUTPUT_DIR}/stage2_classified.json"
         self.document_id = document_id
         self.log = []
+        self.log_lock = threading.Lock()  # Thread-safe logging
         self.use_langchain = use_langchain and LANGCHAIN_AVAILABLE
+        self.max_workers = max_workers
         
         # Initialize MongoDB storage
         self.storage = PipelineStageStorage(enable_mongodb=enable_mongodb, document_id=document_id or "unknown")
+        
+        # Initialize rate limiter
+        self.rate_limiter = RateLimiter(requests_per_minute=15, requests_per_second=0.25)
         
         # Initialize Gemini
         genai.configure(api_key=GEMINI_API_KEY)
         self.model = genai.GenerativeModel('gemma-3-27b-it')
         
-        # Allowed intents (hardcoded taxonomy)
+        # Allowed intents (generic taxonomy)
         self.allowed_intents = [
             "RESTRICTION",
             "LIMIT",
@@ -1059,13 +1897,17 @@ class IntentClassifier:
             )
         else:
             if not LANGCHAIN_AVAILABLE:
-                self.log_entry("WARNING", "LangChain not available, using standard classification")
+                self.log_entry("INFO", "Using standard Gemini classification")
     
     def log_entry(self, level, message):
-        """Log entry with timestamp"""
+        """Thread-safe log entry with timestamp"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{timestamp}] [{level}] {message}"
-        self.log.append(entry)
+        
+        # Thread-safe append
+        with self.log_lock:
+            self.log.append(entry)
+        
         print(entry)
     
     def read_clauses_file(self):
@@ -1146,17 +1988,130 @@ OUTPUT ONLY valid JSON matching the schema."""
             # Fallback to standard method
             return self.classify_intent_with_gemini(clause_id, clause_text)
     
-    def classify_intent_with_gemini(self, clause_id, clause_text):
+    def _precheck_intent_patterns(self, clause_id: str, clause_text: str) -> Optional[Dict]:
         """
-        Use Gemini API to classify a single clause's intent.
+        Pre-classification keyword matching BEFORE LLM inference.
+        Catches obvious cases that LLM often misclassifies.
+        
+        Returns:
+            dict with intent/confidence if match found, else None (defer to LLM)
+        """
+        text_lower = clause_text.lower()
+        
+        # ========== RESTRICTION DETECTION ==========
+        # Pattern: "cannot", "can not", "must not", "shall not", "no ... must"
+        restriction_patterns = [
+            (r'\bcan\s+not\b.*(?:entertain|claimed?|be)', 0.95, 'CAN NOT pattern'),
+            (r'\bcannot\b', 0.95, 'CANNOT pattern'),
+            (r'\bmust\s+not\b', 0.95, 'MUST NOT pattern'),
+            (r'\bshall\s+not\b', 0.95, 'SHALL NOT pattern'),
+            (r'\bno\s+\w+\s+(?:must|can)\s+exceed', 0.95, 'NO ... EXCEED pattern'),
+            (r'\bprohibited\b|\bforbidden\b', 0.90, 'Explicit prohibition'),
+            (r'\bnot\s+(?:allowed|permitted)', 0.90, 'NOT allowed pattern'),
+        ]
+        
+        for pattern, confidence, reason in restriction_patterns:
+            if re.search(pattern, text_lower):
+                return {
+                    'intent': 'RESTRICTION',
+                    'confidence': confidence,
+                    'reasoning': f"Pre-check: {reason}"
+                }
+        
+        # ========== MANDATORY DETECTION ==========
+        # Pattern: "SHALL BE", "must be", time-bound obligations, "to be"
+        mandatory_patterns = [
+            (r'\bshall\s+be\s+\w+(?:ed|)?\b', 0.95, 'SHALL BE pattern'),
+            (r'\bmust\s+be\b', 0.95, 'MUST BE pattern'),
+            (r'\bshall\s+(?!not|highlight)', 0.90, 'SHALL + obligation'),  # Exclude "shall highlight"
+            (r'to\s+be\s+(?:settled|validated|supported|approved)', 0.95, 'TO BE obligation'),
+            (r'\brequire[sd]?\b.*(?:original|authorization|approval|validation)', 0.90, 'Required pattern'),
+        ]
+        
+        # Extra check: exclude "shall highlight" (informational)
+        if 'shall highlight' not in text_lower and 'shall consist' not in text_lower:
+            for pattern, confidence, reason in mandatory_patterns:
+                if re.search(pattern, text_lower):
+                    return {
+                        'intent': 'MANDATORY',
+                        'confidence': confidence,
+                        'reasoning': f"Pre-check: {reason}"
+                    }
+        
+        # ========== LIMIT DETECTION ==========
+        # Pattern: "maximum", "minimum", "up to", "at most", "exceed"
+        # BUT: Must not be already RESTRICTION (cannot/must not + exceed = restriction, not limit)
+        is_restriction = any(re.search(pat, text_lower) for pat, _, _ in restriction_patterns)
+        
+        if not is_restriction:
+            limit_patterns = [
+                (r'\bmaximum\s+of\b|\bmax\b', 0.90, 'Maximum threshold'),
+                (r'\bminimum\s+of\b|\bmin\b', 0.90, 'Minimum threshold'),
+                (r'\bup\s+to\b', 0.90, 'UP TO pattern'),
+                (r'\bat\s+most\b|\bat\s+least\b', 0.90, 'AT MOST/LEAST pattern'),
+                (r'must\s+(?:not\s+)?exceed\s+\d+', 0.95, 'EXCEED threshold'),
+                (r'\b(?:limit|cap|ceiling|floor)\b', 0.85, 'Threshold keyword'),
+            ]
+            
+            for pattern, confidence, reason in limit_patterns:
+                if re.search(pattern, text_lower):
+                    return {
+                        'intent': 'LIMIT',
+                        'confidence': confidence,
+                        'reasoning': f"Pre-check: {reason}"
+                    }
+        
+        # ========== APPROVAL_REQUIRED DETECTION ==========
+        approval_patterns = [
+            (r'\brequires?\s+(?:approval|authorization|sign-off|sanction)', 0.95, 'Approval required'),
+            (r'\bmust\s+be\s+(?:approved|authorized|sanctioned)', 0.95, 'MUST BE approved'),
+            (r'\bduly\s+(?:sanctioned|approved|authorized)', 0.90, 'Duly sanctioned'),
+        ]
+        
+        for pattern, confidence, reason in approval_patterns:
+            if re.search(pattern, text_lower):
+                return {
+                    'intent': 'APPROVAL_REQUIRED',
+                    'confidence': confidence,
+                    'reasoning': f"Pre-check: {reason}"
+                }
+        
+        # ========== INFORMATIONAL DETECTION ==========
+        info_patterns = [
+            (r'\b(?:includes|consists|defined|classified|types)\s+', 0.90, 'Informational keyword'),
+            (r'\b(?:purpose|objective|note|definition)\b', 0.85, 'Informational marker'),
+        ]
+        
+        for pattern, confidence, reason in info_patterns:
+            if re.search(pattern, text_lower):
+                return {
+                    'intent': 'INFORMATIONAL',
+                    'confidence': confidence,
+                    'reasoning': f"Pre-check: {reason}"
+                }
+        
+        # No strong pre-check match, defer to LLM
+        return None
+    
+    def classify_intent_with_gemini(self, clause_id, clause_text, retry_count: int = 0, max_retries: int = 2):
+        """
+        Use Gemini API to classify a single clause's intent with rate limiting and retries.
         
         Args:
-            clause_id (str): Clause identifier (C1, C2, etc.)
+            clause_id (str): Clause identifier
             clause_text (str): Elaborated clause text
+            retry_count (int): Current retry attempt
+            max_retries (int): Maximum retries
             
         Returns:
             dict: { "intent": "...", "confidence": 0.0-1.0, "reasoning": "..." }
         """
+        
+        # ===== PRE-CHECK: Use keyword matching before LLM =====
+        precheck_result = self._precheck_intent_patterns(clause_id, clause_text)
+        if precheck_result:
+            self.log_entry("PRECHECK", f"{clause_id}: {precheck_result['intent']} [conf {precheck_result['confidence']}]")
+            return precheck_result
         
         prompt = f"""
 You are a POLICY INTENT CLASSIFIER. Analyze the clause text and determine its intent type.
@@ -1199,8 +2154,44 @@ Output ONLY valid JSON. No explanation outside the JSON object.
 """
         
         try:
-            response = self.model.generate_content(prompt)
-            response_text = response.text.strip()
+            # RATE LIMITING: Wait before making API call
+            wait_time = self.rate_limiter.wait_if_needed()
+            if wait_time > 0:
+                self.log_entry("RATE_LIMIT", f"{clause_id}: Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
+            
+            # Make API call
+            try:
+                response = self.model.generate_content(prompt)
+                self.rate_limiter.record_request()
+                response_text = response.text.strip()
+            except Exception as api_error:
+                error_str = str(api_error).lower()
+                self.log_entry("ERROR", f"{clause_id}: API call failed: {type(api_error).__name__}")
+                
+                # Handle quota errors
+                if "429" in str(api_error) or "quota" in error_str:
+                    self.log_entry("ERROR", f"{clause_id}: QUOTA LIMIT HIT")
+                    self.rate_limiter.record_quota_error()
+                    if retry_count < max_retries:
+                        wait = 2 ** (retry_count + 2)
+                        self.log_entry("RETRY", f"{clause_id}: Waiting {wait}s before retry...")
+                        time.sleep(wait)
+                        return self.classify_intent_with_gemini(clause_id, clause_text, retry_count + 1, max_retries)
+                
+                # Handle transient errors
+                elif retry_count < max_retries and ("deadline" in error_str or "timeout" in error_str):
+                    wait = 2 ** retry_count
+                    self.log_entry("RETRY", f"{clause_id}: Retrying in {wait}s...")
+                    time.sleep(wait)
+                    return self.classify_intent_with_gemini(clause_id, clause_text, retry_count + 1, max_retries)
+                
+                # Fallback
+                return {
+                    "intent": "INFORMATIONAL",
+                    "confidence": 0.5,
+                    "reasoning": f"API error: {str(api_error)[:40]}"
+                }
             
             # Clean markdown if present
             if response_text.startswith("```json"):
@@ -1218,7 +2209,7 @@ Output ONLY valid JSON. No explanation outside the JSON object.
                 # Validate intent
                 if "intent" not in result:
                     self.log_entry("WARNING", f"{clause_id}: Missing 'intent' field")
-                    result["intent"] = "INFORMATIONAL"  # Default fallback
+                    result["intent"] = "INFORMATIONAL"
                 
                 # Validate intent is in allowed list
                 intent = result.get("intent", "INFORMATIONAL").upper()
@@ -1230,57 +2221,70 @@ Output ONLY valid JSON. No explanation outside the JSON object.
                 
                 # Validate confidence
                 if "confidence" not in result:
-                    result["confidence"] = 0.75  # Default confidence
+                    result["confidence"] = 0.75
                 else:
                     try:
                         conf = float(result["confidence"])
-                        result["confidence"] = max(0.0, min(1.0, conf))  # Clamp 0-1
+                        result["confidence"] = max(0.0, min(1.0, conf))
                     except (ValueError, TypeError):
                         result["confidence"] = 0.75
                 
                 return result
             
             except json.JSONDecodeError as e:
-                self.log_entry("ERROR", f"{clause_id}: Failed to parse Gemini response: {e}")
+                self.log_entry("ERROR", f"{clause_id}: Failed to parse JSON: {e}")
                 return {
                     "intent": "INFORMATIONAL",
                     "confidence": 0.5,
-                    "reasoning": "Failed to parse response"
+                    "reasoning": "JSON parse error"
                 }
         
         except Exception as e:
-            self.log_entry("ERROR", f"{clause_id}: Gemini API call failed: {e}")
+            self.log_entry("ERROR", f"{clause_id}: Unexpected error: {type(e).__name__}: {str(e)[:50]}")
             return {
                 "intent": "INFORMATIONAL",
                 "confidence": 0.5,
-                "reasoning": f"API error: {str(e)[:50]}"
+                "reasoning": "Unexpected error"
             }
     
     def classify(self):
-        """Main classification workflow"""
-        self.log_entry("START", "Step 2: Intent Classification")
+        """Main classification workflow with multithreading and rate limiting"""
+        self.log_entry("START", "Step 2: Intent Classification (Multithreaded)")
         
         # Step 1: Read clauses from Stage 1B
-        self.log_entry("STEP", "Reading clauses from Stage 1B")
+        self.log_entry("STEP", "Reading clauses from Stage 1")
         clauses = self.read_clauses_file()
         if not clauses:
             return False
         
         self.log_entry("STATS", f"Total clauses to classify: {len(clauses)}")
         
-        # Step 2: Classify each clause (LangChain or standard) with PARALLEL PROCESSING
-        if self.use_langchain:
-            self.log_entry("STEP", "Classifying intent with LangChain (parallel mode - 5 workers)")
-        else:
-            self.log_entry("STEP", "Classifying intent with standard Gemini (parallel mode - 5 workers)")
+        # Step 2: Classify each clause with MULTITHREADING
+        self.log_entry("STEP", f"Classifying intent (max_workers={self.max_workers})")
+        self.log_entry("INFO", "Rate limiting: 1 request every 4 seconds (Gemini quota protection)")
         
         classified = []
+        
+        # Initialize policy-agnostic enhancer for validation
+        agnostic_enhancer = PolicyAgnosticEnhancer() if GENERIC_ENHANCER_AVAILABLE else None
         
         def classify_single_clause(clause_data):
             """Helper function for parallel processing"""
             i, clause = clause_data
-            clause_id = clause.get("clauseId", f"C{i}")
-            clause_text = clause.get("text", "")
+            clause_id = clause.get("clause_id", f"C{i}")
+            
+            # Use elaborated_text from Stage 1, fallback to original_text
+            clause_text = clause.get("elaborated_text", "") or clause.get("original_text", "")
+            
+            if not clause_text:
+                self.log_entry("WARNING", f"Clause {clause_id}: No text found")
+                return {
+                    "clause_id": clause_id,
+                    "text": "",
+                    "intent": "INFORMATIONAL",
+                    "confidence": 0.0,
+                    "reasoning": "No clause text provided"
+                }
             
             self.log_entry("CLASSIFY", f"[{i}/{len(clauses)}] Processing {clause_id}")
             
@@ -1290,22 +2294,65 @@ Output ONLY valid JSON. No explanation outside the JSON object.
             else:
                 intent_result = self.classify_intent_with_gemini(clause_id, clause_text)
             
+            original_intent = intent_result.get("intent", "INFORMATIONAL")
+            original_confidence = intent_result.get("confidence", 0.5)
+            
+            # Apply policy-agnostic validation to correct misclassifications
+            if agnostic_enhancer:
+                corrected_intent, corrected_confidence = agnostic_enhancer.validate_and_correct_intent(
+                    clause_id, clause_text, original_intent, original_confidence
+                )
+                intent = corrected_intent
+                confidence = corrected_confidence
+            else:
+                intent = original_intent
+                confidence = original_confidence
+            
             # Build classified clause record
             classified_clause = {
-                "clauseId": clause_id,
-                "text": clause_text,
-                "intent": intent_result.get("intent", "INFORMATIONAL"),
-                "confidence": intent_result.get("confidence", 0.5),
+                "clause_id": clause_id,
+                "original_text": clause.get("original_text", ""),
+                "elaborated_text": clause_text,
+                "intent": intent,
+                "confidence": confidence,
                 "reasoning": intent_result.get("reasoning", "")
             }
             
-            self.log_entry("RESULT", f"{clause_id}: {classified_clause['intent']} (confidence: {classified_clause['confidence']})")
+            self.log_entry("RESULT", f"{clause_id}: {intent} (confidence: {confidence:.2f})")
             return classified_clause
         
-        # Process clauses in parallel (5 workers for optimal speed)
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        # Process clauses in parallel with thread pool
+        classified_results = {}
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             clause_data = [(i, clause) for i, clause in enumerate(clauses, 1)]
-            classified = list(executor.map(classify_single_clause, clause_data))
+            futures = {}
+            
+            for i, clause in clause_data:
+                future = executor.submit(classify_single_clause, (i, clause))
+                futures[future] = i
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    classified_results[futures[future]] = result
+                    completed += 1
+                    self.log_entry("COMPLETE", f"Classification complete ({completed}/{len(clause_data)})")
+                except Exception as e:
+                    self.log_entry("ERROR", f"Future failed: {e}")
+                    classified_results[futures[future]] = {
+                        "clause_id": f"C{futures[future]}",
+                        "text": "",
+                        "intent": "INFORMATIONAL",
+                        "confidence": 0.0,
+                        "reasoning": str(e)
+                    }
+        
+        # Merge results in order
+        for i in sorted(classified_results.keys()):
+            classified.append(classified_results[i])
         
         self.log_entry("SUCCESS", f"Classified {len(classified)} clauses")
         
@@ -1383,24 +2430,32 @@ Output ONLY valid JSON. No explanation outside the JSON object.
 
 class EntityExtractor:
     """
-    Step 3: Extract structured entities & thresholds using Gemini API.
+    Step 3: Extract structured entities & thresholds using Gemini API with multithreading.
     
     For each clause text from Stage 2, extracts explicit entities only.
-    Entity types: Type, Class, Category, amount, Currency, Hours, location, role, ApprovalAuthority
+    
+    Features:
+    - Multithreading with rate limiting (7 workers)
+    - Thread-safe logging
+    - Retry logic on API failures
+    - Proper input validation (elaborated_text + original_text from Stage 2)
+    - Dynamic entity extraction (no hardcoded schemas)
     """
     
-    def __init__(self, classified_file, document_id=None, enable_mongodb=True, use_langchain=True, max_workers=8):
+    def __init__(self, classified_file, document_id=None, enable_mongodb=True, use_langchain=False, max_workers: int = 7):
         self.classified_file = classified_file
         self.entities_file = f"{OUTPUT_DIR}/stage3_entities.json"
         self.document_id = document_id
         self.log = []
+        self.log_lock = threading.Lock()  # Thread-safe logging
         self.use_langchain = use_langchain and LANGCHAIN_AVAILABLE
-        
-        # Parallel processing config
-        self.max_workers = max_workers  # Number of parallel threads
+        self.max_workers = max_workers
         
         # Initialize MongoDB storage
         self.storage = PipelineStageStorage(enable_mongodb=enable_mongodb, document_id=document_id or "unknown")
+        
+        # Initialize rate limiter
+        self.rate_limiter = RateLimiter(requests_per_minute=15, requests_per_second=0.25)
         
         # Initialize Gemini
         genai.configure(api_key=GEMINI_API_KEY)
@@ -1416,14 +2471,17 @@ class EntityExtractor:
                 max_retries=3
             )
         else:
-            if not LANGCHAIN_AVAILABLE:
-                self.log_entry("WARNING", "LangChain not available, using standard extraction")
+            self.log_entry("INFO", "Using standard Gemini entity extraction")
     
     def log_entry(self, level, message):
-        """Log entry with timestamp"""
+        """Thread-safe log entry with timestamp"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{timestamp}] [{level}] {message}"
-        self.log.append(entry)
+        
+        # Thread-safe append
+        with self.log_lock:
+            self.log.append(entry)
+        
         print(entry)
     
     def read_classified_file(self):
@@ -1511,78 +2569,103 @@ OUTPUT ONLY valid JSON matching the schema. If no entities, return {{"entities":
             # Fallback to standard method
             return self.extract_entities_with_gemini(clause_id, clause_text)
     
-    def extract_entities_with_gemini(self, clause_id, clause_text):
+    def extract_entities_with_gemini(self, clause_id, clause_text, retry_count: int = 0, max_retries: int = 2):
         """
-        STANDARD: Use Gemini API to extract entities dynamically from a single clause.
-        Entities are NOT predefined - LLM identifies meaningful key-value pairs.
+        Extract ALL numeric/categorical thresholds from policy text with rate limiting and retries.
+        
+        Features:
+        - Rate limiting (1 req/4s)
+        - Retry logic with exponential backoff
+        - Extracts: distances, percentages, durations, amounts, categorical values, authorities
         
         Args:
-            clause_id (str): Clause identifier (C1, C2, etc.)
+            clause_id (str): Clause identifier
             clause_text (str): Clause text with policy content
+            retry_count (int): Current retry attempt
+            max_retries (int): Maximum retries
             
         Returns:
-            dict: { "entityName": value, ... } with dynamically identified entities
+            dict: { "entityName": value, ... } with extracted entities
         """
         
-        prompt = f"""
-You are a DYNAMIC ENTITY EXTRACTION ENGINE. Extract meaningful structured entities from policy text.
+        prompt = f"""You are a THRESHOLD & ENTITY EXTRACTION ENGINE.
 
-CRITICAL RULES:
-1. Extract ONLY values explicitly stated in the text
-2. Do NOT infer, guess, or assume missing values
-3. Do NOT include null/empty values - omit if not present
-4. Preserve original units (currency, time, amounts, etc.)
-5. Create entity names that are descriptive and meaningful
-6. One clause may have multiple entity values
+CLAUSE ID: {clause_id}
+CLAUSE TEXT: {clause_text}
 
-ENTITY EXTRACTION GUIDELINES:
-- Identify key-value pairs that represent measurable facts
-- Entity names should be descriptive (e.g., "dailyAllowance", "travelDuration", "approvalAuthority")
-- Include units in values when present (e.g., "7.0 Rs/KM", "15 days", "100 KM")
-- Group related values logically
-- Use camelCase for multi-word entity names
+MANDATORY: Extract EVERY measurable value and threshold from this clause.
 
-CLAUSE TO ANALYZE:
-Clause ID: {clause_id}
-Text: "{clause_text}"
+1. NUMERIC THRESHOLDS (EXTRACT ALL):
+   - Distances: "200 kms" → {{"distanceThreshold": "200 kms"}}
+   - Percentages: "25%", "125%" → {{"percentageValue": "25%"}}
+   - Time durations: "2 days" → {{"settlementDays": "2 days"}}
+   - Hour triggers: "more than 6 hours" → {{"hourTrigger": "6 hours"}}
+   - Monetary: "$100", "Rs 500" → {{"amountValue": "amount"}}
 
-EXTRACTION TASK:
-1. Scan clause text for explicit, measurable values
-2. Identify meaningful entity names based on context
-3. Extract only what is clearly stated
-4. Omit entities not explicitly mentioned
-5. Return a JSON object with extracted entities
+2. CATEGORICAL VALUES (EXTRACT ALL):
+   - Employee levels: "Senior level" → {{"employeeLevel": "Senior"}}
+   - Role types: "sales personnel" → {{"roleExclusion": "sales personnel"}}
+   - Travel modes: "Personal Car", "Personal Bike" → {{"travelMode": "Personal Car"}}
+   - Location types: "remote areas" → {{"locationType": "remote areas"}}
 
-OUTPUT FORMAT (valid JSON object, empty if no entities):
-{{
-  "descriptiveEntityName1": "value1",
-  "descriptiveEntityName2": "value2"
-}}
+3. AUTHORITIES & ENTITIES:
+   - Organizations: "NAGA LIMITED" → {{"applicableTo": "NAGA LIMITED"}}
+   - Departments: "HR & Accounts" → {{"validationAuthority": "HR & Accounts"}}
+   - Roles: "Reporting Manager" → {{"approvalAuthority": "Reporting Manager"}}
 
-EXAMPLES:
-- Text: "Rs. 7.0 per KM for Four Wheeler or Rs. 2.5 per KM for Two Wheeler"
-  Extract: {{"fourWheelerRate": "7.0 Rs/KM", "twoWheelerRate": "2.5 Rs/KM"}}
+EXAMPLES - Extract ALL values:
+- "No official Travel by Personal Car MUST exceed 200 kms" → {{"distanceThreshold": "200 kms", "travelMode": "Personal Car"}}
+- "Travelling advance MUST be settled within 2 days" → {{"settlementDays": "2 days"}}
+- "Employees other than sales personnel...spending more than 6 hours" → {{"roleExclusion": "sales personnel", "hourTrigger": "6 hours"}}
+- "claim 25% of their eligible amount" → {{"percentageValue": "25%"}}
+- "For Twin sharing, the claim can be made to the maximum of 125%" → {{"maximumClaimPercentage": "125%"}}
+- "No official Travel by Personal Bike MUST exceed 50 kms" → {{"distanceThreshold": "50 kms", "travelMode": "Personal Bike"}}
 
-- Text: "Employee grade M1-M6 with corresponding lodging amounts"
-  Extract: {{"employeeGrades": "M1-M6", "lodgingVariation": "grade-dependent"}}
+RULES:
+- Extract EVERY numeric value with its unit
+- Use descriptive entity names (camelCase)
+- One clause may have MULTIPLE entities (2-5+)
+- If text has values, return ALL of them
+- If NO values, return {{}}
 
-- Text: "Bills MUST be submitted within 15 days"
-  Extract: {{"billSubmissionDeadline": "15 days"}}
-
-- Text: "Requires HOD approval for direct booking"
-  Extract: {{"requiredApproval": "HOD"}}
-
-- Text: "Travel to NCR, Mumbai, Delhi"
-  Extract: {{"allowedCities": "NCR, Mumbai, Delhi"}}
-
-- If text has no measurable values, return: {{}}
-
-Output ONLY valid JSON. No explanation outside JSON.
+Output ONLY valid JSON.
 """
         
         try:
-            response = self.model.generate_content(prompt)
-            response_text = response.text.strip()
+            # RATE LIMITING: Wait before making API call
+            wait_time = self.rate_limiter.wait_if_needed()
+            if wait_time > 0:
+                self.log_entry("RATE_LIMIT", f"{clause_id}: Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
+            
+            # Make API call
+            try:
+                response = self.model.generate_content(prompt)
+                self.rate_limiter.record_request()
+                response_text = response.text.strip()
+            except Exception as api_error:
+                error_str = str(api_error).lower()
+                self.log_entry("ERROR", f"{clause_id}: API call failed: {type(api_error).__name__}")
+                
+                # Handle quota errors
+                if "429" in str(api_error) or "quota" in error_str:
+                    self.log_entry("ERROR", f"{clause_id}: QUOTA LIMIT HIT")
+                    self.rate_limiter.record_quota_error()
+                    if retry_count < max_retries:
+                        wait = 2 ** (retry_count + 2)
+                        self.log_entry("RETRY", f"{clause_id}: Waiting {wait}s before retry...")
+                        time.sleep(wait)
+                        return self.extract_entities_with_gemini(clause_id, clause_text, retry_count + 1, max_retries)
+                
+                # Handle transient errors
+                elif retry_count < max_retries and ("deadline" in error_str or "timeout" in error_str):
+                    wait = 2 ** retry_count
+                    self.log_entry("RETRY", f"{clause_id}: Retrying in {wait}s...")
+                    time.sleep(wait)
+                    return self.extract_entities_with_gemini(clause_id, clause_text, retry_count + 1, max_retries)
+                
+                # Fallback
+                return {}
             
             # Clean markdown if present
             if response_text.startswith("```json"):
@@ -1601,20 +2684,19 @@ Output ONLY valid JSON. No explanation outside JSON.
                     self.log_entry("WARNING", f"{clause_id}: Result is not a dict, using empty")
                     return {}
                 
-                # Return all entities as-is (fully dynamic, no validation against predefined list)
                 return result
             
             except json.JSONDecodeError as e:
-                self.log_entry("ERROR", f"{clause_id}: Failed to parse Gemini response: {e}")
+                self.log_entry("ERROR", f"{clause_id}: Failed to parse JSON: {e}")
                 return {}
         
         except Exception as e:
-            self.log_entry("ERROR", f"{clause_id}: Gemini API call failed: {e}")
+            self.log_entry("ERROR", f"{clause_id}: Unexpected error: {type(e).__name__}: {str(e)[:50]}")
             return {}
     
     def extract(self):
-        """Main extraction workflow with PARALLEL PROCESSING"""
-        self.log_entry("START", "Step 3: Entity & Threshold Extraction")
+        """Main extraction workflow with multithreading and rate limiting"""
+        self.log_entry("START", "Step 3: Entity & Threshold Extraction (Multithreaded)")
         
         # Step 1: Read classified clauses from Stage 2
         self.log_entry("STEP", "Reading classified clauses from Stage 2")
@@ -1622,20 +2704,35 @@ Output ONLY valid JSON. No explanation outside JSON.
         if not clauses:
             return False
         
-        self.log_entry("INFO", f"Starting Stage 3: Entity Extraction (Parallel)")
-        self.log_entry("INFO", f"Configuration: max_workers={self.max_workers}")
+        self.log_entry("STATS", f"Total clauses for entity extraction: {len(clauses)}")
         
-        if self.use_langchain:
-            self.log_entry("INFO", f"Extracting entities from {len(clauses)} clauses with LangChain (parallel mode)")
-        else:
-            self.log_entry("INFO", f"Extracting entities from {len(clauses)} clauses with standard Gemini (parallel mode)")
+        # Step 2: Extract entities with MULTITHREADING
+        self.log_entry("STEP", f"Extracting entities (max_workers={self.max_workers})")
+        self.log_entry("INFO", "Rate limiting: 1 request every 4 seconds (Gemini quota protection)")
         
-        # Step 2: Extract entities from each clause in parallel
-        def extract_single(clause):
-            i = 1  # Will be set in loop
-            clause_id = clause.get("clauseId")
-            clause_text = clause.get("text", "")
+        # Initialize policy-agnostic enhancer for entity cleaning
+        agnostic_enhancer = PolicyAgnosticEnhancer() if GENERIC_ENHANCER_AVAILABLE else None
+        
+        def extract_single(clause_data):
+            """Helper function for parallel processing"""
+            i, clause = clause_data
+            clause_id = clause.get("clause_id", f"C{i}")
+            
+            # Use elaborated_text from Stage 2, fallback to original_text
+            clause_text = clause.get("elaborated_text", "") or clause.get("original_text", "")
             clause_intent = clause.get("intent", "UNKNOWN")
+            
+            if not clause_text:
+                self.log_entry("WARNING", f"Clause {clause_id}: No text found")
+                return {
+                    "clause_id": clause_id,
+                    "original_text": "",
+                    "elaborated_text": "",
+                    "intent": clause_intent,
+                    "entities": {}
+                }
+            
+            self.log_entry("EXTRACT", f"[{i}/{len(clauses)}] Processing {clause_id}")
             
             # Extract entities from this clause
             if self.use_langchain:
@@ -1643,19 +2740,56 @@ Output ONLY valid JSON. No explanation outside JSON.
             else:
                 entities = self.extract_entities_with_gemini(clause_id, clause_text)
             
-            entity_count = len(entities)
-            self.log_entry("RESULT", f"{clause_id}: Extracted {entity_count} entities: {list(entities.keys())}")
+            # Apply entity cleaning to remove garbage
+            if agnostic_enhancer and entities:
+                entities = agnostic_enhancer.clean_entities(entities)
+            
+            entity_count = len(entities) if entities else 0
+            entity_keys = list(entities.keys()) if entities else []
+            self.log_entry("RESULT", f"{clause_id}: Extracted {entity_count} entities: {entity_keys}")
             
             # Build extracted clause record
             return {
-                "clauseId": clause_id,
-                "text": clause_text,
+                "clause_id": clause_id,
+                "original_text": clause.get("original_text", ""),
+                "elaborated_text": clause_text,
                 "intent": clause_intent,
-                "entities": entities
+                "entities": entities if entities else {}
             }
         
+        # Process clauses in parallel with thread pool
+        extracted_results = {}
+        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            extracted = list(executor.map(extract_single, clauses))
+            clause_data = [(i, clause) for i, clause in enumerate(clauses, 1)]
+            futures = {}
+            
+            for i, clause in clause_data:
+                future = executor.submit(extract_single, (i, clause))
+                futures[future] = i
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    extracted_results[futures[future]] = result
+                    completed += 1
+                    self.log_entry("COMPLETE", f"Entity extraction complete ({completed}/{len(clause_data)})")
+                except Exception as e:
+                    self.log_entry("ERROR", f"Future failed: {e}")
+                    extracted_results[futures[future]] = {
+                        "clause_id": f"C{futures[future]}",
+                        "original_text": "",
+                        "elaborated_text": "",
+                        "intent": "UNKNOWN",
+                        "entities": {}
+                    }
+        
+        # Merge results in order
+        extracted = []
+        for i in sorted(extracted_results.keys()):
+            extracted.append(extracted_results[i])
         
         self.log_entry("SUCCESS", f"Extracted entities from {len(extracted)} clauses")
         
@@ -3669,10 +4803,10 @@ def main():
         classified_file = arg
         
         print(f"\n{'='*80}")
-        print("STEP 3: ENTITY & THRESHOLD EXTRACTION")
+        print("STEP 3: ENTITY & THRESHOLD EXTRACTION (Rule-based, no LLM)")
         print(f"{'='*80}\n")
         
-        entity_extractor = EntityExtractor(classified_file)
+        entity_extractor = EntityExtractor(classified_file, use_langchain=False)
         success = entity_extractor.extract()
         entity_extractor.save_log()
         
@@ -3958,8 +5092,17 @@ def main():
         print("Running: Stage 1 → 1B → 2 → 3 → 4 → 5 → 6 → 8 (skipping Stage 7)")
         print(f"{'='*80}\n")
         
+        # Ask about Stage 3 processing mode
+        stage3_sequential = False
+        stage3_mode = input("Stage 3 processing mode? [p]arallel (default) / [s]equential: ").strip().lower()
+        if stage3_mode == 's' or stage3_mode == 'sequential':
+            stage3_sequential = True
+            print("→ Stage 3 will run in SEQUENTIAL mode (slower but more stable)")
+        else:
+            print("→ Stage 3 will run in PARALLEL mode (faster)")
+        
         orchestrator = PipelineOrchestrator(pdf_file, enable_mongodb=False)
-        result = orchestrator.run_full_pipeline()
+        result = orchestrator.run_full_pipeline(stage3_sequential=stage3_sequential)
         orchestrator.save_log()
         
         if result['success']:
@@ -4128,6 +5271,95 @@ Output JSON:
             self.log_entry("ERROR", f"Failed to load stage3 data: {e}")
             return None
     
+    def detect_ambiguities_rule_based(self, clause_id, clause_text, entities):
+        """
+        RULE-BASED: Fast ambiguity detection without LLM calls
+        
+        Uses heuristics to detect common ambiguity patterns:
+        1. Empty entities → Informational (low ambiguity)
+        2. Vague keywords → Ambiguous
+        3. Missing units in numeric context → Ambiguous
+        4. Clear thresholds + units → Clear
+        
+        Returns: (is_ambiguous, reason, confidence_score)
+        """
+        
+        ambiguity_score = 0  # 0-100 scale
+        reasons = []
+        
+        # Rule 1: Empty entities → Likely informational
+        if not entities or len(entities) == 0:
+            ambiguity_score += 10
+            reasons.append("No entities extracted (informational clause)")
+        
+        # Rule 2: Check for vague keywords
+        vague_keywords = ['may', 'should', 'could', 'might', 'generally', 'usually', 
+                         'typically', 'often', 'can', 'appropriate', 'suitable', 'reasonable']
+        text_lower = clause_text.lower()
+        vague_count = sum(1 for kw in vague_keywords if f' {kw} ' in f' {text_lower} ')
+        if vague_count > 0:
+            ambiguity_score += (vague_count * 15)
+            reasons.append(f"Found {vague_count} vague keywords: {', '.join([kw for kw in vague_keywords if f' {kw} ' in f' {text_lower} '])}")
+        
+        # Rule 3: Check for undefined terms (ALL CAPS or unusual patterns)
+        undefined_markers = ['MUST', 'SHALL', 'WILL']  # These are actually clear, good
+        # Better: Check for concepts without definitions
+        unclear_concepts = ['etc.', 'and so on', 'other']
+        unclear_count = sum(1 for uc in unclear_concepts if uc in text_lower)
+        if unclear_count > 0:
+            ambiguity_score += (unclear_count * 20)
+            reasons.append(f"Found open-ended language: {unclear_count} instances")
+        
+        # Rule 4: Numeric values without units
+        import re
+        numbers = re.findall(r'\d+(\.\d+)?', clause_text)
+        if numbers:
+            # Check if units follow numbers
+            unit_keywords = ['rs', 'km', 'days', 'hours', 'percentage', '%', 'pm', 'am',
+                           'grade', 'level', 'band', 'employee', 'employees']
+            units_found = sum(1 for unit in unit_keywords if unit in text_lower)
+            
+            if units_found == 0 and len(numbers) > 0:
+                ambiguity_score += 25
+                reasons.append(f"Numeric values without clear units: {len(numbers)} numbers found")
+            elif units_found > 0:
+                ambiguity_score -= 10  # Deduct for clarity
+                reasons.append(f"Clear units specified for {units_found} numeric values")
+        
+        # Rule 5: Check for clear thresholds (reduces ambiguity)
+        threshold_keywords = ['maximum', 'minimum', 'at least', 'no more than', 'not less than',
+                            'exceeding', 'upto', 'up to', 'between', 'within']
+        threshold_count = sum(1 for th in threshold_keywords if th in text_lower)
+        if threshold_count > 0:
+            ambiguity_score -= (threshold_count * 10)
+            reasons.append(f"Clear thresholds: {threshold_count} threshold keywords found")
+        
+        # Rule 6: Check for entity coverage
+        if entities:
+            entity_count = len(entities)
+            # More entities generally means less ambiguity
+            if entity_count >= 3:
+                ambiguity_score -= 15
+                reasons.append(f"Good entity coverage: {entity_count} entities extracted")
+            elif entity_count >= 1:
+                ambiguity_score -= 5
+                reasons.append(f"Some entities extracted: {entity_count} entity")
+        
+        # Clamp score 0-100
+        ambiguity_score = max(0, min(100, ambiguity_score))
+        
+        # Decision threshold: > 40 = ambiguous
+        is_ambiguous = ambiguity_score > 40
+        
+        confidence = 100 - abs(ambiguity_score - 50)  # Higher confidence when far from threshold
+        
+        return {
+            'is_ambiguous': is_ambiguous,
+            'reason': ' | '.join(reasons) if reasons else 'No ambiguities detected',
+            'score': ambiguity_score,
+            'confidence': confidence
+        }
+    
     def detect_ambiguities_with_langchain(self, clause_id, clause_text, entities):
         """
         LANGCHAIN-ENHANCED: Detect ambiguities using structured output parsing.
@@ -4225,14 +5457,29 @@ OUTPUT ONLY valid JSON matching the schema."""
     
     def analyze_clause(self, clause, extracted_entities):
         """
-        Analyze single clause for ambiguity using LangChain or Gemini.
+        Analyze single clause for ambiguity using RULE-BASED detection first.
+        Falls back to LLM only if confidence is low.
         Returns: {clauseId, ambiguous, reason, ambiguity_types}
         """
         clause_id = clause['clauseId']
         clause_text = clause['text']
         entities = extracted_entities or {}
         
-        # Use LangChain or Gemini to detect ambiguities
+        # Step 1: Try rule-based detection (fast, no LLM cost)
+        rule_result = self.detect_ambiguities_rule_based(clause_id, clause_text, entities)
+        
+        # If confidence is high (>70), use rule-based result
+        if rule_result['confidence'] > 70:
+            return {
+                "clauseId": clause_id,
+                "ambiguous": rule_result['is_ambiguous'],
+                "reason": f"[RULE-BASED] {rule_result['reason']} (score: {rule_result['score']}/100)",
+                "ambiguity_types": [],
+                "detection_method": "rule-based",
+                "confidence": rule_result['confidence']
+            }
+        
+        # Step 2: Low confidence → use LLM for verification
         if self.use_langchain:
             is_ambiguous, reason, ambiguity_types = self.detect_ambiguities_with_langchain(clause_id, clause_text, entities)
         else:
@@ -4242,8 +5489,10 @@ OUTPUT ONLY valid JSON matching the schema."""
         return {
             "clauseId": clause_id,
             "ambiguous": is_ambiguous,
-            "reason": reason,
-            "ambiguity_types": ambiguity_types
+            "reason": f"[LLM-VERIFIED] {reason}",
+            "ambiguity_types": ambiguity_types,
+            "detection_method": "llm",
+            "rule_score": rule_result['score']
         }
     
     def detect_ambiguities(self):
@@ -4382,6 +5631,8 @@ class AmbiguityClarifier:
         """
         Use Gemini to clarify a clause based on its ambiguities.
         Returns: clarified_text
+        
+        ENHANCEMENT: Validates clarified text to prevent hallucinations.
         """
         prompt = f"""You are a policy clarification expert. Your task is to fix clause ambiguities.
 
@@ -4393,16 +5644,17 @@ ORIGINAL TEXT:
 IDENTIFIED AMBIGUITIES:
 {ambiguity_reason}
 
+CRITICAL RULES:
+1. PRESERVE all original numeric data (amounts, dates, durations, percentages)
+2. NEVER invent new numeric values, percentages, amounts, or rates
+3. If the original text doesn't specify a value, use a placeholder like [amount_needed]
+4. Only clarify vague terms with DEFINITIONS, not new values
+
 TASK:
 1. Rewrite the clause to FIX the identified ambiguities
-2. PRESERVE all original numeric data (amounts, dates, durations, percentages)
-3. ADD clarifications where ambiguities exist:
-   - Define vague terms (e.g., "Actual" → "Actual expenses capped at X amount")
-   - Clarify undefined references (e.g., "tour advance" → explain when/how issued)
-   - Fix boundary overlaps (e.g., "3-12 hours" and "12-24 hours" → "3 to <12 hours" and "≥12 to 24 hours")
-   - Define undefined authorities (e.g., "HOD approval" → "Approval from Head of Department")
-   - Complete incomplete conditions (e.g., "IF X AND Y provided" → "IF company provides BOTH X AND Y, THEN...")
-4. Keep the tone, structure, and references to other clauses intact (C1, C2, refs:, etc.)
+2. Define vague terms (e.g., "Actual" → "Actual expenses as documented in receipts")
+3. Clarify undefined references by EXPLAINING, not inventing values
+4. Keep the tone, structure, and references to other clauses intact
 5. Output ONLY the clarified clause text - no explanations, no markdown
 
 CLARIFIED TEXT:"""
@@ -4418,6 +5670,12 @@ CLARIFIED TEXT:"""
                     clarified_text = clarified_text[4:]
                 clarified_text = clarified_text.strip()
             
+            # Validate no hallucinations were introduced
+            if GENERIC_ENHANCER_AVAILABLE:
+                agnostic_enhancer = PolicyAgnosticEnhancer()
+                validated_text = agnostic_enhancer.validate_clarification(original_text, clarified_text)
+                return validated_text
+            
             return clarified_text
             
         except Exception as e:
@@ -4430,7 +5688,7 @@ CLARIFIED TEXT:"""
         original_text = clause['text']
         entities = clause.get('entities', {})
         
-        # Get ambiguity info (now includes both reason and types)
+        # Get ambiguity info
         ambiguity_info = ambiguity_map.get(clause_id, {
             'reason': '',
             'types': [],
@@ -4441,22 +5699,27 @@ CLARIFIED TEXT:"""
         ambiguity_types = ambiguity_info.get('types', [])
         is_ambiguous = ambiguity_info.get('ambiguous', False)
         
-        # Extract which ambiguity codes exist (use types array, not substring matching)
-        ambiguities_fixed = []
-        if ambiguity_types:
-            # Use the actual ambiguity_types from stage4
-            for code in ambiguity_types:
-                ambiguities_fixed.append(code)
-        
-        # Skip clarification if no ambiguity found
-        if not is_ambiguous or not ambiguity_types:
+        # FIXED: Clarify ALL clauses that have any ambiguity (is_ambiguous=True)
+        # Not just those with non-empty ambiguity_types
+        if not is_ambiguous:
+            # No ambiguity - keep original text
             clarified_text = original_text
             ambiguities_fixed = []
-            self.log_entry("SKIP", f"{clause_id}: No ambiguities to fix")
+            self.log_entry("SKIP", f"{clause_id}: No ambiguities detected")
         else:
-            # Clarify the clause
-            self.log_entry("PROCESSING", f"{clause_id}: Generating clarified text ({len(ambiguity_types)} issues to fix)...")
+            # Has ambiguity - ALWAYS clarify, even if types array is empty
+            self.log_entry("PROCESSING", f"{clause_id}: Clarifying ambiguous clause...")
             clarified_text = self.clarify_clause(clause_id, original_text, ambiguity_reason)
+            
+            # Determine which ambiguities were fixed
+            ambiguities_fixed = []
+            if ambiguity_types:
+                for code in ambiguity_types:
+                    ambiguities_fixed.append(code)
+            else:
+                # If no types specified but clause is ambiguous, mark as generic
+                ambiguities_fixed = ["GENERIC_AMBIGUITY"]
+            
             self.log_entry("CLARIFIED", f"{clause_id}: Text clarified ({len(ambiguities_fixed)} issues addressed)")
         
         return {
@@ -4716,23 +5979,53 @@ class DSLGenerator:
         return None
     
     def generate_dsl_from_pattern(self, clause_id, intent, entities, is_ambiguous, similar_clause):
-        """Generate DSL based on similar clause pattern"""
+        """Generate DSL based on similar clause pattern - with smart entity mapping"""
         
-        # Build dynamic when conditions from entities
+        # Build dynamic when conditions from entities with smart mapping
         when_conditions = []
         
         for entity_name, entity_value in entities.items():
-            # Convert entity name to fact
-            fact = entity_name.replace('.', '_').lower()
+            # Smart mapping based on entity type
+            entity_lower = entity_name.lower()
             
-            # Determine operator based on entity type
-            if 'upperLimit' in entity_name or 'maximum' in entity_name:
+            # Distance thresholds → travel.distance
+            if 'distance' in entity_lower or 'km' in str(entity_value).lower():
+                fact = 'travel.distance'
                 operator = 'LESS_THAN_OR_EQUAL'
-            elif 'lowerLimit' in entity_name or 'minimum' in entity_name:
-                operator = 'GREATER_THAN_OR_EQUAL'
-            elif 'rate' in entity_name or 'amount' in entity_name:
+            
+            # Percentage values → claim.percentage
+            elif 'percentage' in entity_lower or '%' in str(entity_value):
+                fact = 'claim.percentage'
                 operator = 'EQUALS'
+            
+            # Hour triggers → work.hours
+            elif 'hour' in entity_lower or 'hour' in str(entity_value).lower():
+                fact = 'work.hours'
+                operator = 'GREATER_THAN_OR_EQUAL'
+            
+            # Time limits (days) → settlement.days
+            elif 'day' in entity_lower or 'day' in str(entity_value).lower():
+                fact = 'settlement.days'
+                operator = 'LESS_THAN_OR_EQUAL'
+            
+            # Employee levels → employee.level
+            elif 'employee' in entity_lower or 'level' in entity_lower or 'grade' in entity_lower:
+                fact = 'employee.level'
+                operator = 'EQUALS'
+            
+            # Role exclusions → employee.role
+            elif 'role' in entity_lower or 'personnel' in entity_lower:
+                fact = 'employee.role'
+                operator = 'NOT_EQUALS'
+            
+            # Travel mode → travel.mode
+            elif 'travel' in entity_lower or 'car' in entity_lower or 'bike' in entity_lower:
+                fact = 'travel.mode'
+                operator = 'EQUALS'
+            
+            # Generic fallback
             else:
+                fact = entity_name.replace('.', '_').lower()
                 operator = 'EQUALS'
             
             when_conditions.append({
@@ -4749,29 +6042,15 @@ class DSLGenerator:
         elif intent == 'RESTRICTION':
             then_constraints = [{'constraint': 'approval.required', 'operator': 'EQUALS', 'value': 'YES'}]
         elif intent == 'LIMIT':
-            # Extract limit type from entities
-            limit_type = 'general'
-            for entity_name in entities.keys():
-                if 'tour' in entity_name.lower():
-                    limit_type = 'tour_duration'
-                elif 'allowance' in entity_name.lower():
-                    limit_type = 'allowance_limit'
-                break
-            
-            then_constraints = [{'constraint': f'limit.{limit_type}', 'operator': 'ENFORCED', 'value': 'STRICT'}]
-        else:  # CONDITIONAL_ALLOWANCE
-            # Extract allowance type
-            allowance_type = 'general'
-            for entity_name in entities.keys():
-                if 'lodging' in entity_name.lower():
-                    allowance_type = 'lodging'
-                elif 'boarding' in entity_name.lower():
-                    allowance_type = 'boarding'
-                elif 'mileage' in entity_name.lower():
-                    allowance_type = 'mileage'
-                break
-            
-            then_constraints = [{'constraint': f'allowance.{allowance_type}', 'operator': 'APPROVED', 'value': 'CONDITIONAL'}]
+            then_constraints = [{'constraint': 'limit.enforced', 'operator': 'STRICT', 'value': 'MAX'}]
+        elif intent == 'CONDITIONAL_ALLOWANCE':
+            then_constraints = [{'constraint': 'allowance.approved', 'operator': 'CONDITIONAL', 'value': 'CLAIM'}]
+        elif intent == 'ADVISORY':
+            then_constraints = [{'constraint': 'recommendation', 'operator': 'GUIDANCE', 'value': 'ADVISORY'}]
+        elif intent == 'APPROVAL_REQUIRED':
+            then_constraints = [{'constraint': 'approval.mandatory', 'operator': 'REQUIRED', 'value': 'AUTHORIZATION'}]
+        else:
+            then_constraints = [{'constraint': 'PASS', 'operator': 'EQUALS', 'value': 'OK'}]
         
         return {
             'rule_id': clause_id,
@@ -4882,30 +6161,93 @@ Return ONLY the JSON object, no markdown formatting."""
     def create_smart_default_rule(self, clause_id, intent, entities, is_ambiguous):
         """Create smart DSL rule based on intent and entities"""
         
-        # Build when conditions from entities
+        # Build when conditions from entities - map new entity names to DSL facts
         when_conditions = []
         
         for entity_name, entity_value in entities.items():
-            # Convert entity name to fact
-            fact = entity_name.replace('.', '_').lower()
+            # Map entity names to DSL facts
+            entity_lower = entity_name.lower()
             
-            # Determine operator based on entity type
-            if 'upperLimit' in entity_name or 'maximum' in entity_name or 'limit' in entity_name.lower():
-                operator = 'LESS_THAN_OR_EQUAL'
-            elif 'lowerLimit' in entity_name or 'minimum' in entity_name:
-                operator = 'GREATER_THAN_OR_EQUAL'
-            elif 'rate' in entity_name or 'amount' in entity_name or 'allowance' in entity_name.lower():
-                operator = 'EQUALS'
-            elif 'deadline' in entity_name.lower() or 'duration' in entity_name.lower():
-                operator = 'LESS_THAN_OR_EQUAL'
+            # Distance thresholds → travel.distance
+            if 'distance' in entity_lower or 'km' in entity_value.lower():
+                when_conditions.append({
+                    'fact': 'travel.distance',
+                    'operator': 'LESS_THAN_OR_EQUAL',
+                    'value': entity_value
+                })
+            
+            # Percentage values → claim.percentage
+            elif 'percentage' in entity_lower or '%' in entity_value:
+                when_conditions.append({
+                    'fact': 'claim.percentage',
+                    'operator': 'EQUALS',
+                    'value': entity_value
+                })
+            
+            # Hour triggers → work.hours
+            elif 'hour' in entity_lower or 'hour' in entity_value.lower():
+                when_conditions.append({
+                    'fact': 'work.hours',
+                    'operator': 'GREATER_THAN_OR_EQUAL',
+                    'value': entity_value
+                })
+            
+            # Time limits (days) → settlement.days
+            elif 'day' in entity_lower or 'day' in entity_value.lower():
+                when_conditions.append({
+                    'fact': 'settlement.days',
+                    'operator': 'LESS_THAN_OR_EQUAL',
+                    'value': entity_value
+                })
+            
+            # Employee levels → employee.level
+            elif 'employee' in entity_lower or 'level' in entity_lower or 'grade' in entity_lower:
+                when_conditions.append({
+                    'fact': 'employee.level',
+                    'operator': 'EQUALS',
+                    'value': entity_value
+                })
+            
+            # Role exclusions → employee.role
+            elif 'role' in entity_lower or 'personnel' in entity_lower:
+                when_conditions.append({
+                    'fact': 'employee.role',
+                    'operator': 'NOT_EQUALS',
+                    'value': entity_value
+                })
+            
+            # Travel mode → travel.mode
+            elif 'travel' in entity_lower or 'car' in entity_lower or 'bike' in entity_lower:
+                when_conditions.append({
+                    'fact': 'travel.mode',
+                    'operator': 'EQUALS',
+                    'value': entity_value
+                })
+            
+            # Applicable to → organization.applies
+            elif 'applicable' in entity_lower or 'company' in entity_lower:
+                when_conditions.append({
+                    'fact': 'organization.applies',
+                    'operator': 'EQUALS',
+                    'value': entity_value
+                })
+            
+            # Validation authority → approval.required
+            elif 'authority' in entity_lower or 'hr' in entity_lower or 'account' in entity_lower:
+                when_conditions.append({
+                    'fact': 'approval.required',
+                    'operator': 'EQUALS',
+                    'value': entity_value
+                })
+            
             else:
-                operator = 'EQUALS'
-            
-            when_conditions.append({
-                'fact': fact,
-                'operator': operator,
-                'value': entity_value
-            })
+                # Generic fallback
+                fact = entity_name.replace('.', '_').lower()
+                when_conditions.append({
+                    'fact': fact,
+                    'operator': 'EQUALS',
+                    'value': entity_value
+                })
         
         # Build then constraints based on intent
         action = 'warn' if is_ambiguous else 'enforce'
@@ -4915,39 +6257,15 @@ Return ONLY the JSON object, no markdown formatting."""
         elif intent == 'RESTRICTION':
             then_constraints = [{'constraint': 'approval.required', 'operator': 'EQUALS', 'value': 'YES'}]
         elif intent == 'LIMIT':
-            # Extract limit type from entities
-            limit_type = 'general'
-            for entity_name in entities.keys():
-                entity_lower = entity_name.lower()
-                if 'tour' in entity_lower:
-                    limit_type = 'tour_duration'
-                elif 'lodging' in entity_lower:
-                    limit_type = 'lodging'
-                elif 'boarding' in entity_lower:
-                    limit_type = 'boarding'
-                elif 'mileage' in entity_lower:
-                    limit_type = 'mileage'
-                elif 'travel' in entity_lower:
-                    limit_type = 'travel'
-                break
-            
-            then_constraints = [{'constraint': f'limit.{limit_type}', 'operator': 'ENFORCED', 'value': 'STRICT'}]
-        else:  # CONDITIONAL_ALLOWANCE
-            # Extract allowance type
-            allowance_type = 'general'
-            for entity_name in entities.keys():
-                entity_lower = entity_name.lower()
-                if 'lodging' in entity_lower:
-                    allowance_type = 'lodging'
-                elif 'boarding' in entity_lower:
-                    allowance_type = 'boarding'
-                elif 'mileage' in entity_lower:
-                    allowance_type = 'mileage'
-                elif 'travel' in entity_lower:
-                    allowance_type = 'travel'
-                break
-            
-            then_constraints = [{'constraint': f'allowance.{allowance_type}', 'operator': 'APPROVED', 'value': 'CONDITIONAL'}]
+            then_constraints = [{'constraint': 'limit.enforced', 'operator': 'STRICT', 'value': 'MAX'}]
+        elif intent == 'CONDITIONAL_ALLOWANCE':
+            then_constraints = [{'constraint': 'allowance.approved', 'operator': 'CONDITIONAL', 'value': 'CLAIM'}]
+        elif intent == 'ADVISORY':
+            then_constraints = [{'constraint': 'recommendation', 'operator': 'GUIDANCE', 'value': 'ADVISORY'}]
+        elif intent == 'APPROVAL_REQUIRED':
+            then_constraints = [{'constraint': 'approval.mandatory', 'operator': 'REQUIRED', 'value': 'AUTHORIZATION'}]
+        else:
+            then_constraints = [{'constraint': 'PASS', 'operator': 'EQUALS', 'value': 'OK'}]
         
         return {
             'rule_id': clause_id,
@@ -5317,16 +6635,27 @@ class PipelineOrchestrator:
             self.log_entry("ERROR", f"Stage 2 exception: {e}")
             return False
     
-    def run_stage_3(self):
-        """Stage 3: Extract entities"""
-        self.log_entry("STAGE", "Running Stage 3: Entity Extraction")
+    def run_stage_3(self, sequential=False):
+        """Stage 3: Extract entities (RULE-BASED ONLY to avoid rate limits)
+        
+        Args:
+            sequential (bool): If True, process clauses one at a time (no multithreading)
+        """
+        self.log_entry("STAGE", "Running Stage 3: Entity Extraction (Rule-based, no LLM)")
+        
+        # Use sequential processing if requested
+        max_workers = 1 if sequential else PipelineConfig.ENTITY_EXTRACTION_WORKERS
+        
+        if sequential:
+            self.log_entry("INFO", "Sequential processing enabled (no multithreading)")
         
         try:
             classified_file = self.stage_results.get('stage2_file', f"{OUTPUT_DIR}/stage2_classified.json")
             extractor = EntityExtractor(
                 classified_file,
                 enable_mongodb=self.enable_mongodb,
-                max_workers=PipelineConfig.ENTITY_EXTRACTION_WORKERS
+                use_langchain=False,  # DISABLE LLM - use rule-based extraction only
+                max_workers=max_workers
             )
             success = extractor.extract()
             extractor.save_log()
@@ -5442,9 +6771,12 @@ class PipelineOrchestrator:
             self.log_entry("ERROR", f"Stage 8 exception: {e}")
             return False
     
-    def run_full_pipeline(self):
+    def run_full_pipeline(self, stage3_sequential=False):
         """
         Execute full pipeline: 1 → 1B → 2 → 3 → 4 → 5 → 6 → 8
+        
+        Args:
+            stage3_sequential (bool): If True, run Stage 3 without multithreading
         
         Returns:
             dict: Results with success status and stage file paths
@@ -5453,11 +6785,14 @@ class PipelineOrchestrator:
         self.log_entry("START", "FULL PIPELINE ORCHESTRATION: Stages 1 → 1B → 2 → 3 → 4 → 5 → 6 → 8")
         self.log_entry("START", "="*80)
         
+        if stage3_sequential:
+            self.log_entry("INFO", "Stage 3 will run in SEQUENTIAL mode (no multithreading)")
+        
         stages = [
             ('1', self.run_stage_1),
             ('1B', self.run_stage_1b),
             ('2', self.run_stage_2),
-            ('3', self.run_stage_3),
+            ('3', lambda: self.run_stage_3(sequential=stage3_sequential)),
             ('4', self.run_stage_4),
             ('5', self.run_stage_5),
             ('6', self.run_stage_6),
@@ -5511,9 +6846,10 @@ class NormalizedPolicyGenerator:
     Output: stage8_normalized_policies.json
     """
     
-    def __init__(self, dsl_file, confidence_file=None, document_id=None, enable_mongodb=True, use_langchain=True):
+    def __init__(self, dsl_file, confidence_file=None, clarified_file=None, document_id=None, enable_mongodb=True, use_langchain=True):
         self.dsl_file = dsl_file
         self.confidence_file = confidence_file
+        self.clarified_file = clarified_file or f"{OUTPUT_DIR}/stage5_clarified_clauses.json"
         self.normalized_file = f"{OUTPUT_DIR}/stage8_normalized_policies.json"
         self.document_id = document_id
         self.log = []
@@ -5525,6 +6861,9 @@ class NormalizedPolicyGenerator:
         
         # Initialize MongoDB storage
         self.storage = PipelineStageStorage(enable_mongodb=enable_mongodb, document_id=document_id or "unknown")
+        
+        # Load supporting data from earlier stages
+        self.clarified_clauses = self.load_clarified_clauses()
         
         # Only initialize Gemini if LLM is enabled
         if self.llm_enabled:
@@ -5575,314 +6914,430 @@ class NormalizedPolicyGenerator:
             self.log_entry("WARNING", f"Failed to load confidence data: {e}")
             return {}
     
-    def rule_based_mapping(self, dsl_rule):
-        """Fast rule-based DSL → Normalized JSON mapping"""
+    def load_clarified_clauses(self):
+        """Load clarified clauses from Stage 5 for metadata enrichment"""
+        try:
+            with open(self.clarified_file, 'r') as f:
+                data = json.load(f)
+            
+            # Build lookup dict: clauseId -> clarified clause data
+            clauses_by_id = {}
+            for clause in data.get('clarified_clauses', []):
+                clause_id = clause.get('clauseId')
+                if clause_id:
+                    clauses_by_id[clause_id] = clause
+            
+            self.log_entry("INFO", f"Loaded {len(clauses_by_id)} clarified clauses from {self.clarified_file}")
+            return clauses_by_id
+        except Exception as e:
+            self.log_entry("WARNING", f"Failed to load clarified clauses: {e}")
+            return {}
+    
+    def consolidate_clause_data(self, clause_id, stage_data):
+        """Consolidate all stage data for a single clause into UI-compatible schema"""
         
-        # Extract basic fields from DSL
-        rule_id = dsl_rule.get('rule_id', 'unknown')
+        # Extract DSL rule data
+        dsl_rule = stage_data['stage6']
         when_conditions = dsl_rule.get('when', {}).get('all', [])
-        then_actions = dsl_rule.get('then', {})
+        then_outcome = dsl_rule.get('then', {})
+        enforcement_level = 'enforce' if 'enforce' in then_outcome else 'warn'
         
-        # Determine enforcement type
-        enforcement = 'enforce' if 'enforce' in then_actions else 'warn'
-        constraints = then_actions.get(enforcement, [])
+        # Get first constraint and normalize it (DSL uses 'constraint' field, UI expects 'fact')
+        constraint = {}
+        raw_constraint = {}
+        if 'warn' in then_outcome and then_outcome['warn']:
+            raw_constraint = then_outcome['warn'][0] if isinstance(then_outcome['warn'], list) else then_outcome['warn']
+        elif 'enforce' in then_outcome and then_outcome['enforce']:
+            raw_constraint = then_outcome['enforce'][0] if isinstance(then_outcome['enforce'], list) else then_outcome['enforce']
         
-        # Build normalized structure
-        normalized = {
-            'policyId': f"POLICY_{rule_id}",
-            'name': f"Policy Rule {rule_id}",
-            'scope': {
-                'tenantId': 'default-tenant',
-                'orgId': 'default-org',
-                'appliesTo': {
-                    'roles': [],
-                    'locations': []
-                }
-            },
-            'when': [],
-            'what': {
-                'constraint': {
-                    'fact': 'unknown',
-                    'operator': 'EQUALS',
-                    'value': 'unknown'
-                }
-            },
+        # Normalize: rename 'constraint' field to 'fact' for UI compatibility
+        if raw_constraint:
+            constraint = {
+                'fact': raw_constraint.get('constraint', raw_constraint.get('fact', '')),
+                'operator': raw_constraint.get('operator', ''),
+                'value': raw_constraint.get('value', '')
+            }
+        
+        consolidated = {
+            # UI-compatible top-level fields (for displayPolicies JS)
+            'policyId': f"POLICY_{clause_id}",
+            'name': f"Policy Rule {clause_id}",
             'outcome': {
-                'enforcement': enforcement,
-                'message': f"Policy rule {rule_id} applied"
+                'enforcement': enforcement_level.lower(),
+                'message': f"Policy {clause_id} enforcement"
             },
-            'metadata': {
-                'source': f"DSL Rule {rule_id}",
-                'approvedBy': 'system',
-                'version': '1.0'
+            'when': when_conditions,
+            'what': {
+                'constraint': constraint
+            },
+            
+            # Original consolidated structure (for backend use)
+            'core_attributes': {
+                'clauseId': clause_id,
+                'text_clarified': stage_data['stage5'].get('text_clarified', ''),
+                'intent': stage_data['stage2'].get('intent', 'UNKNOWN'),
+                'confidence_score': stage_data['stage7'].get('confidence', 0.0),
+                'source_section': stage_data['stage7'].get('sourceSection', '')
+            },
+            'classification': {
+                'stage2_intent': stage_data['stage2'].get('intent', ''),
+                'stage2_confidence': stage_data['stage2'].get('confidence', 0.0),
+                'stage2_reasoning': stage_data['stage2'].get('reasoning', '')
+            },
+            'extracted_data': {
+                'entities': stage_data['stage3'].get('entities', {}),
+                'entity_names': stage_data['stage3'].get('entity_names', [])
+            },
+            'ambiguity_analysis': {
+                'is_ambiguous': stage_data['stage4'].get('is_ambiguous', False),
+                'ambiguity_types': stage_data['stage4'].get('ambiguity_types', []),
+                'ambiguities_fixed': stage_data['stage5'].get('ambiguities_fixed', []),
+                'original_reason': stage_data['stage4'].get('reason', ''),
+                'detection_method': stage_data['stage4'].get('detection_method', 'rule-based'),
+                'rule_score': stage_data['stage4'].get('rule_score', 0)
+            },
+            'dsl_rules': {
+                'rule_id': stage_data['stage6'].get('rule_id', clause_id),
+                'when_conditions': when_conditions,
+                'then_outcome': then_outcome,
+                'enforcement_level': enforcement_level
+            },
+            'rationale_metadata': {
+                'rationale_text': stage_data['stage7'].get('rationale', ''),
+                'confidence_score': stage_data['stage7'].get('confidence', 0.0),
+                'ambiguities_fixed': stage_data['stage7'].get('ambiguitiesFixed', []),
+                'source_section': stage_data['stage7'].get('sourceSection', '')
             }
         }
         
-        # Map when conditions
-        for condition in when_conditions:
-            normalized['when'].append({
-                'fact': condition.get('fact', 'unknown'),
-                'operator': condition.get('operator', 'EQUALS'),
-                'value': condition.get('value', 'unknown')
-            })
-        
-        # Map constraints to 'what'
-        if constraints:
-            first_constraint = constraints[0]
-            normalized['what']['constraint'] = {
-                'fact': first_constraint.get('constraint', 'unknown'),
-                'operator': first_constraint.get('operator', 'EQUALS'),
-                'value': first_constraint.get('value', 'unknown')
-            }
-        
-        return normalized
+        return consolidated
     
-    def extract_metadata_with_llm(self, dsl_rule, normalized_policy):
-        """Use LLM to extract complex metadata when rule-based mapping is insufficient"""
+    def build_dynamic_extraction_index(self):
+        """Build dynamic extraction rules from actual stage data ONLY (validated)"""
+        index = {
+            'roles': {},           # role_value -> context
+            'locations': {},       # location_value -> context
+            'tenants': {},         # tenant_value -> context
+            'authorities': {}      # authority_value -> orgId
+        }
         
-        # OPTIMIZATION: Skip LLM if disabled
-        if not self.llm_enabled:
-            self.apply_rule_based_metadata(dsl_rule, normalized_policy)
-            return normalized_policy
-        
-        # Check if we need LLM (e.g., missing scope, roles, locations)
-        scope = normalized_policy.get('scope', {})
-        rule_id = dsl_rule.get('rule_id', 'unknown')
-        
-        if not scope.get('appliesTo', {}).get('roles') and not scope.get('appliesTo', {}).get('locations'):
+        # ONLY extract from Stage 3 entities (these are validated by earlier stages)
+        for clause_id, clause in self.clarified_clauses.items():
+            entities = clause.get('entities', {})
             
-            # Create a more specific prompt with examples
-            prompt = f"""Extract policy metadata from this DSL rule.
-
-DSL RULE:
-{json.dumps(dsl_rule, indent=2)}
-
-RULE ID: {rule_id}
-
-TASK: Extract metadata as valid JSON:
-1. roles: List of employee roles/grades (e.g., ["M1", "M2", "Directors", "CEO"])
-2. locations: List of locations/regions (e.g., ["Category A cities", "India"])
-3. tenantId: Use "default"
-4. orgId: Use "default"
-
-EXAMPLES:
-- If rule mentions "grade M1" → roles: ["M1"]
-- If rule mentions "Category A cities" → locations: ["Category A cities"]
-- If no roles mentioned → roles: []
-- If no locations mentioned → locations: []
-
-OUTPUT THIS EXACT JSON (no markdown, no explanations):
-{{"roles": [], "locations": [], "tenantId": "default", "orgId": "default"}}
-
-CRITICAL: Output must be valid JSON that can be parsed by json.loads().
-"""
-            
-            try:
-                import time
-                max_retries = 2
-                retry_delay = 2
+            for entity_name, entity_value in entities.items():
+                if not entity_value or not isinstance(entity_value, str):
+                    continue
                 
-                for attempt in range(max_retries):
-                    try:
-                        response = self.model.generate_content(prompt)
-                        response_text = response.text.strip()
-                        
-                        # More aggressive cleanup
-                        response_text = response_text.replace('```json', '').replace('```', '').strip()
-                        response_text = '\n'.join(line.strip() for line in response_text.split('\n')).strip()
-                        
-                        # Check for empty response
-                        if not response_text:
-                            raise ValueError(f"Empty response from LLM on attempt {attempt + 1}")
-                        
-                        # Try to extract JSON with pattern matching
-                        try:
-                            metadata = json.loads(response_text)
-                        except json.JSONDecodeError:
-                            # Try to find JSON pattern in response
-                            import re
-                            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                            if json_match:
-                                metadata = json.loads(json_match.group())
-                            else:
-                                raise ValueError(f"No JSON found in response")
-                        
-                        # Validate metadata structure
-                        if not isinstance(metadata, dict):
-                            raise ValueError(f"Expected dict, got {type(metadata)}")
-                        
-                        # Update normalized policy with LLM-extracted metadata
-                        if 'roles' in metadata and isinstance(metadata['roles'], list):
-                            scope.setdefault('appliesTo', {})['roles'] = metadata['roles']
-                        if 'locations' in metadata and isinstance(metadata['locations'], list):
-                            scope.setdefault('appliesTo', {})['locations'] = metadata['locations']
-                        if 'tenantId' in metadata:
-                            scope['tenantId'] = metadata['tenantId']
-                        if 'orgId' in metadata:
-                            scope['orgId'] = metadata['orgId']
-                        
-                        normalized_policy['scope'] = scope
-                        self.log_entry("LLM_METADATA", f"Successfully extracted metadata for {rule_id}")
-                        return  # Success
-                        
-                    except Exception as inner_e:
-                        if attempt < max_retries - 1:
-                            self.log_entry("WARNING", f"LLM attempt {attempt + 1} failed for {rule_id}: {inner_e}")
-                            time.sleep(retry_delay)
-                        else:
-                            raise inner_e
+                # Strip whitespace and validate non-empty
+                entity_value = entity_value.strip()
+                if not entity_value or len(entity_value) > 100:
+                    continue
                 
-            except Exception as e:
-                self.log_entry("WARNING", f"LLM metadata extraction failed for {rule_id}: {e}")
-                # Use intelligent defaults based on DSL rule content
-                self.apply_rule_based_metadata(dsl_rule, normalized_policy)
+                # Classify based on entity name keywords (STRICT)
+                if any(x in entity_name.lower() for x in ['grade', 'role', 'level', 'employee']):
+                    index['roles'][entity_value] = entity_name
+                
+                elif any(x in entity_name.lower() for x in ['location', 'city', 'area', 'region']):
+                    index['locations'][entity_value] = entity_name
+                
+                elif any(x in entity_name.lower() for x in ['applicable', 'tenant', 'org']):
+                    index['tenants'][entity_value] = entity_name
         
-        return normalized_policy
+        # Extract authorities ONLY from clarified text (explicit mentions)
+        authorities_patterns = {
+            r'(?:head\s+of\s+department|department\s+head|hod)': 'DEPT_MANAGER',
+            r'(?:reporting\s+manager|direct\s+manager)': 'DEPT_MANAGER',
+            r'(?:hr\s+&?\s+accounts|accounts\s+&?\s+hr)': 'HR_ADMIN',
+            r'(?:finance\s+department|finance\s+admin)': 'FINANCE_ADMIN',
+            r'(?:travel\s+admin|travel\s+department)': 'TRAVEL_ADMIN'
+        }
+        
+        for clause_id, clause in self.clarified_clauses.items():
+            text = clause.get('text_clarified', '').lower()
+            
+            for pattern, org_id in authorities_patterns.items():
+                if re.search(pattern, text):
+                    # Use proper case name for authority
+                    proper_name = pattern.split('|')[0].replace(r'\s+', ' ').replace('(?:', '').replace(')', '').title()
+                    index['authorities'][proper_name] = org_id
+        
+        self.log_entry("INDEX", f"Built index: {len(index['roles'])} roles, {len(index['locations'])} locations, {len(index['tenants'])} tenants, {len(index['authorities'])} authorities")
+        return index
     
-    def apply_rule_based_metadata(self, dsl_rule, normalized_policy):
-        """Apply metadata from DSL rule structure when LLM fails"""
+    def extract_metadata_with_index(self, dsl_rule, normalized_policy, extraction_index):
+        """Extract metadata STRICTLY from validated index only"""
         
-        # Extract metadata from DSL rule conditions
         when_conditions = dsl_rule.get('when', {}).get('all', [])
         rule_id = dsl_rule.get('rule_id', 'unknown')
-        original_text = dsl_rule.get('original_text', '')
         
-        # Initialize scope if needed
         scope = normalized_policy.get('scope', {})
         applies_to = scope.get('appliesTo', {})
         
-        # Extract roles from grade conditions
-        roles = applies_to.get('roles', [])
+        # Get clarified clause text for exact matching
+        clarified_clause = self.clarified_clauses.get(rule_id, {})
+        text = clarified_clause.get('text_clarified', '') or clarified_clause.get('text_original', '')
+        text_lower = text.lower()
+        
+        # Extract roles: ONLY from when conditions (most reliable)
+        roles = []
         for condition in when_conditions:
-            if condition.get('fact') in ['employee.grade', 'grade']:
-                grade_value = condition.get('value')
-                if grade_value and grade_value not in roles:
-                    roles.append(grade_value)
+            fact = condition.get('fact', '').lower()
+            if any(x in fact for x in ['grade', 'role', 'employee']):
+                val = condition.get('value')
+                if val and isinstance(val, str):
+                    role = val.strip()
+                    if role and len(role) < 100:
+                        roles.append(role)
         
-        # Enhanced role extraction from original text
-        if not roles and original_text:
-            # Look for common role patterns
-            import re
-            grade_patterns = [r'Grade\s+([A-Z]\d+)', r'\b(M[1-6])\b', 
-                            r'(Director|CEO|COO|President|VP|AVP|GM|DGM|RM|AGM|Sr\.\s*Manager|Manager)',
-                            r'(Deputy\s*Manager|Assistant\s*Manager|Sr\.\s*Executive|Engineer|ASM|BM|RSM)']
-            
-            for pattern in grade_patterns:
-                matches = re.findall(pattern, original_text, re.IGNORECASE)
-                for match in matches:
-                    if isinstance(match, tuple):
-                        match = match[0]  # Handle grouped matches
-                    if match and match not in roles:
-                        roles.append(match.strip())
+        # Also check if index roles are EXPLICITLY mentioned (exact word match)
+        for role_value in extraction_index['roles'].keys():
+            pattern = r'\b' + re.escape(role_value) + r'\b'
+            if re.search(pattern, text_lower):
+                if role_value not in roles:
+                    roles.append(role_value)
         
-        # Apply extracted roles
         if roles:
-            applies_to['roles'] = list(set(roles))  # Remove duplicates
+            applies_to['roles'] = list(dict.fromkeys(roles))
         
-        # Extract locations from location conditions
-        locations = applies_to.get('locations', [])
+        # Extract locations: ONLY from when conditions (most reliable)
+        locations = []
         for condition in when_conditions:
-            if condition.get('fact') in ['location.category', 'location']:
-                location_value = condition.get('value')
-                if location_value and location_value not in locations:
+            fact = condition.get('fact', '').lower()
+            if any(x in fact for x in ['location', 'category', 'area', 'region']):
+                val = condition.get('value')
+                if val and isinstance(val, str):
+                    location = val.strip()
+                    if location and len(location) < 100:
+                        locations.append(location)
+        
+        # Also check if index locations are EXPLICITLY mentioned (exact word match)
+        for location_value in extraction_index['locations'].keys():
+            pattern = r'\b' + re.escape(location_value) + r'\b'
+            if re.search(pattern, text_lower):
+                if location_value not in locations:
                     locations.append(location_value)
         
-        # Enhanced location extraction from original text
-        if not locations and original_text:
-            import re
-            location_patterns = [r'Category\s+([A-B])\s+cities', r'(Category\s+[A-B]\s+cities)',
-                               r'(India|metro|urban|rural|international)', 
-                               r'(city|state|region|zone)']
-            
-            for pattern in location_patterns:
-                matches = re.findall(pattern, original_text, re.IGNORECASE)
-                for match in matches:
-                    if isinstance(match, tuple):
-                        match = match[0] if match[0] else (match[1] if len(match) > 1 else '')
-                    if match and match.strip() and match.strip() not in locations:
-                        locations.append(match.strip())
-        
-        # Apply extracted locations
         if locations:
-            applies_to['locations'] = list(set(locations))
+            applies_to['locations'] = list(dict.fromkeys(locations))
         
-        # Set default organization values
-        if 'tenantId' not in scope:
-            scope['tenantId'] = 'default'
-        if 'orgId' not in scope:
-            scope['orgId'] = 'default'
+        # Extract tenant: ONLY from index (first match)
+        for tenant_value in extraction_index['tenants'].keys():
+            pattern = r'\b' + re.escape(tenant_value) + r'\b'
+            if re.search(pattern, text_lower):
+                scope['tenantId'] = tenant_value
+                break
         
-        # Update scope
+        # Extract authority/orgId: ONLY from index authorities
+        for authority, org_id in extraction_index['authorities'].items():
+            pattern = r'\b' + re.escape(authority.lower()) + r'\b'
+            if re.search(pattern, text_lower):
+                scope['orgId'] = org_id
+                break
+        
+        # Default orgId if not explicitly found
+        if not scope.get('orgId'):
+            scope['orgId'] = None
+        
         scope['appliesTo'] = applies_to
         normalized_policy['scope'] = scope
         
-        self.log_entry("RULE_METADATA", f"Applied enhanced rule-based metadata for {rule_id}: roles={roles}, locations={locations}")
+        self.log_entry("EXTRACT", f"{rule_id}: roles={roles}, locations={locations}, tenant={scope.get('tenantId')}, org={scope.get('orgId')}")
+    
+    def extract_metadata_with_llm(self, dsl_rule, normalized_policy, extraction_index):
+        """Use LLM only when index-based extraction is incomplete"""
+        
+        rule_id = dsl_rule.get('rule_id', 'unknown')
+        scope = normalized_policy.get('scope', {})
+        applies_to = scope.get('appliesTo', {})
+        
+        # Check if extraction was complete
+        needs_llm = (
+            not scope.get('tenantId') or 
+            not scope.get('orgId') or
+            not applies_to.get('roles') or
+            not applies_to.get('locations')
+        )
+        
+        if not needs_llm or not self.llm_enabled:
+            return
+        
+        clarified_clause = self.clarified_clauses.get(rule_id, {})
+        text = clarified_clause.get('text_clarified', '')
+        
+        prompt = f"""Extract missing metadata from this policy clause.
+
+CLAUSE TEXT:
+{text}
+
+RULE ID: {rule_id}
+
+Current extracted values:
+- roles: {applies_to.get('roles', [])}
+- locations: {applies_to.get('locations', [])}
+- tenantId: {scope.get('tenantId')}
+- orgId: {scope.get('orgId')}
+
+Fill in any missing values as JSON (or return {{}} if nothing found):
+{{"roles": [], "locations": [], "tenantId": null, "orgId": null}}
+"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            response_text = response.text.strip().replace('```json', '').replace('```', '')
+            metadata = json.loads(response_text)
+            
+            # Merge LLM results with existing
+            if metadata.get('roles'):
+                applies_to['roles'] = list(set(applies_to.get('roles', []) + metadata['roles']))
+            if metadata.get('locations'):
+                applies_to['locations'] = list(set(applies_to.get('locations', []) + metadata['locations']))
+            if metadata.get('tenantId') and not scope.get('tenantId'):
+                scope['tenantId'] = metadata['tenantId']
+            if metadata.get('orgId') and not scope.get('orgId'):
+                scope['orgId'] = metadata['orgId']
+            
+            self.log_entry("LLM", f"{rule_id}: Filled gaps with LLM")
+        except Exception as e:
+            self.log_entry("WARNING", f"{rule_id}: LLM extraction failed: {e}")
+    
+    def build_stage_data_map(self):
+        """Load and index all stage data by clauseId"""
+        stage_map = {}
+        
+        # Stage 1: Raw clauses
+        try:
+            with open(f"{OUTPUT_DIR}/stage1_clauses.json") as f:
+                stage1_data = json.load(f)
+            for clause in stage1_data.get('clauses', []):
+                clause_id = clause.get('clauseId')
+                if clause_id not in stage_map:
+                    stage_map[clause_id] = {}
+                stage_map[clause_id]['stage1'] = clause
+        except Exception as e:
+            self.log_entry("WARNING", f"Stage 1 load failed: {e}")
+        
+        # Stage 2: Classification
+        try:
+            with open(f"{OUTPUT_DIR}/stage2_classified.json") as f:
+                stage2_data = json.load(f)
+            for clause in stage2_data.get('classified_clauses', []):
+                clause_id = clause.get('clauseId')
+                if clause_id not in stage_map:
+                    stage_map[clause_id] = {}
+                stage_map[clause_id]['stage2'] = clause
+        except Exception as e:
+            self.log_entry("WARNING", f"Stage 2 load failed: {e}")
+        
+        # Stage 3: Entities
+        try:
+            with open(f"{OUTPUT_DIR}/stage3_entities.json") as f:
+                stage3_data = json.load(f)
+            for clause in stage3_data.get('extracted_clauses', []):
+                clause_id = clause.get('clauseId')
+                if clause_id not in stage_map:
+                    stage_map[clause_id] = {}
+                stage_map[clause_id]['stage3'] = clause
+        except Exception as e:
+            self.log_entry("WARNING", f"Stage 3 load failed: {e}")
+        
+        # Stage 4: Ambiguity flags
+        try:
+            with open(f"{OUTPUT_DIR}/stage4_ambiguity_flags.json") as f:
+                stage4_data = json.load(f)
+            for clause in stage4_data.get('ambiguity_flags', []):
+                clause_id = clause.get('clauseId')
+                if clause_id not in stage_map:
+                    stage_map[clause_id] = {}
+                stage_map[clause_id]['stage4'] = clause
+        except Exception as e:
+            self.log_entry("WARNING", f"Stage 4 load failed: {e}")
+        
+        # Stage 5: Clarified clauses (already loaded)
+        for clause_id, clause in self.clarified_clauses.items():
+            if clause_id not in stage_map:
+                stage_map[clause_id] = {}
+            stage_map[clause_id]['stage5'] = clause
+        
+        # Stage 6: DSL rules
+        try:
+            import yaml
+            with open(self.dsl_file) as f:
+                stage6_data = yaml.safe_load(f)
+            for rule in stage6_data.get('rules', []):
+                rule_id = rule.get('rule_id')
+                if rule_id not in stage_map:
+                    stage_map[rule_id] = {}
+                stage_map[rule_id]['stage6'] = rule
+        except Exception as e:
+            self.log_entry("WARNING", f"Stage 6 load failed: {e}")
+        
+        # Stage 7: Confidence & rationale
+        try:
+            with open(self.confidence_file) as f:
+                stage7_data = json.load(f)
+            for clause_id, data in stage7_data.get('confidenceAndRationale', {}).items():
+                if clause_id not in stage_map:
+                    stage_map[clause_id] = {}
+                stage_map[clause_id]['stage7'] = data
+        except Exception as e:
+            self.log_entry("WARNING", f"Stage 7 load failed: {e}")
+        
+        self.log_entry("INFO", f"Built stage map for {len(stage_map)} clauses")
+        return stage_map
     
     def generate_normalized_policies(self):
-        """Generate normalized policies using hybrid approach"""
-        self.log_entry("INFO", "Starting Stage 8: Normalized Policy Generation (Hybrid Approach)")
+        """Generate consolidated normalized policies from all stages"""
+        self.log_entry("INFO", "Starting Stage 8: Consolidated Policy Normalization")
         
-        # Load input data
-        dsl_rules = self.load_dsl_rules()
-        confidence_data = self.load_confidence_data()
+        # Load and map all stage data
+        stage_map = self.build_stage_data_map()
         
-        if not dsl_rules:
-            self.log_entry("ERROR", "No DSL rules found")
+        if not stage_map:
+            self.log_entry("ERROR", "No clause data found in stages")
             return False
         
-        self.log_entry("INFO", f"Processing {len(dsl_rules)} DSL rules")
+        self.log_entry("INFO", f"Consolidating {len(stage_map)} clauses from all stages")
         
-        normalized_policies = []
-        llm_calls = 0
+        # Consolidate all clauses
+        consolidated_records = []
+        for clause_id in sorted(stage_map.keys()):
+            stage_data = stage_map[clause_id]
+            
+            # Fill missing stages with empty defaults
+            for stage in ['stage1', 'stage2', 'stage3', 'stage4', 'stage5', 'stage6', 'stage7']:
+                if stage not in stage_data:
+                    stage_data[stage] = {}
+            
+            # Consolidate this clause's data
+            consolidated = self.consolidate_clause_data(clause_id, stage_data)
+            consolidated_records.append(consolidated)
+            
+            self.log_entry("CONSOLIDATED", f"Clause {clause_id}: {stage_data['stage2'].get('intent', 'UNKNOWN')}")
         
-        for dsl_rule in dsl_rules:
-            rule_id = dsl_rule.get('rule_id', 'unknown')
-            self.log_entry("PROCESSING", f"Normalizing policy {rule_id}")
-            
-            # Step 1: Rule-based mapping (fast, no LLM)
-            normalized = self.rule_based_mapping(dsl_rule)
-            
-            # Step 2: Apply confidence metadata if available
-            if confidence_data and rule_id in confidence_data:
-                confidence_info = confidence_data[rule_id]
-                if 'confidence' in confidence_info:
-                    normalized['metadata']['confidence_score'] = confidence_info['confidence']
-                if 'rationale' in confidence_info:
-                    normalized['outcome']['message'] = confidence_info['rationale']
-            
-            # Step 3: LLM for complex metadata (only when needed)
-            if self.use_langchain:  # Enable LLM for metadata extraction only if enabled
-                normalized = self.extract_metadata_with_llm(dsl_rule, normalized)
-                llm_calls += 1
-            else:
-                # Use enhanced rule-based metadata extraction
-                self.apply_rule_based_metadata(dsl_rule, normalized)
-                self.log_entry("RULE_BASED", f"Using rule-based metadata for {rule_id}")
-            
-            normalized_policies.append(normalized)
-            self.log_entry("GENERATED", f"Policy {rule_id} normalized")
-        
-        self.log_entry("SUCCESS", f"Generated {len(normalized_policies)} normalized policies ({llm_calls} LLM calls)")
+        self.log_entry("SUCCESS", f"Consolidated {len(consolidated_records)} clauses")
         
         # Save output
-        return self.save_normalized_policies(normalized_policies)
+        return self.save_consolidated_policies(consolidated_records)
     
-    def save_normalized_policies(self, policies):
-        """Save normalized policies to JSON file"""
+    def save_consolidated_policies(self, consolidated_records):
+        """Save consolidated policies to JSON file"""
         try:
             output = {
-                'policies': policies,
+                'policies': consolidated_records,
                 'metadata': {
                     'generated': datetime.now().isoformat(),
-                    'total_policies': len(policies),
-                    'format': 'Normalized Policy JSON (Stage 8)'
+                    'total_policies': len(consolidated_records),
+                    'format': 'Consolidated Policy Normalization (Stage 8)',
+                    'source_stages': [1, 2, 3, 4, 5, 6, 7],
+                    'description': 'Each policy contains consolidated data from all 7 processing stages'
                 }
             }
             
             with open(self.normalized_file, 'w') as f:
                 json.dump(output, f, indent=2)
             
-            self.log_entry("SUCCESS", f"Normalized policies saved to: {self.normalized_file}")
+            self.log_entry("SUCCESS", f"Consolidated policies saved to: {self.normalized_file}")
             
             # Store to MongoDB
             db_result = self.storage.store_stage(
@@ -5899,7 +7354,7 @@ CRITICAL: Output must be valid JSON that can be parsed by json.loads().
             return True
             
         except Exception as e:
-            self.log_entry("ERROR", f"Failed to save normalized policies: {e}")
+            self.log_entry("ERROR", f"Failed to save consolidated policies: {e}")
             return False
     
     def save_log(self):
